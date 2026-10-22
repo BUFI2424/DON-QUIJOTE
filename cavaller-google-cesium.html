@@ -1,0 +1,433 @@
+<!-- ============================================================
+  CAVALLER SOBRE GOOGLE 3D MAPS  (visual: Google · física i cavaller: Cesium)
+  Enganxa TOT això al panell HTML de CodePen (deixa CSS i JS buits).
+============================================================ -->
+<link href="https://cdn.jsdelivr.net/npm/cesium@1.120.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.120.0/Build/Cesium/Cesium.js"></script>
+
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#000; font-family:system-ui, sans-serif; }
+  #gmap, #cesium { position:absolute; inset:0; }
+  #gmap   { z-index:1; }
+  #cesium { z-index:2; }                    /* Cesium transparent, a sobre */
+  #cesium .cesium-viewer-bottom { opacity:.6; }
+  #panel {
+    position:absolute; z-index:10; top:16px; left:16px; width:300px;
+    background:rgba(20,20,28,.92); color:#eee; padding:14px; border-radius:10px;
+  }
+  #panel label { display:block; font-size:12px; margin:8px 0 3px; color:#aab; }
+  #panel input { width:100%; box-sizing:border-box; padding:6px; border-radius:6px; border:1px solid #445; background:#111; color:#fff; }
+  #panel button { margin-top:12px; width:100%; padding:8px; border:0; border-radius:6px; background:#c9a227; color:#000; font-weight:600; cursor:pointer; }
+  #hud {
+    position:absolute; z-index:10; top:12px; right:12px; display:none;
+    background:rgba(0,0,0,.6); color:#fff; padding:10px 12px; border-radius:8px; font-size:12px; line-height:1.5; white-space:pre;
+  }
+  #msg { position:absolute; z-index:11; bottom:40px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,.75); color:#fff; padding:8px 14px; border-radius:8px; font-size:13px; display:none; }
+</style>
+
+<div id="gmap"></div>
+<div id="cesium"></div>
+
+<div id="panel">
+  <b>🛡️ Cavaller a Google 3D</b>
+  <label>Google Maps API key</label>
+  <input id="gkey" type="text" autocomplete="off" spellcheck="false">
+  <label>Cesium ion token</label>
+  <input id="ctoken" type="text" autocomplete="off" spellcheck="false">
+  <label>Coordenades d'inici (lat, lon)</label>
+  <input id="coords" value="40.075666, -2.123075">
+  <label>ID de l'asset del cavaller (Cesium ion)</label>
+  <input id="asset" value="6069389">
+  <label>…o URL directa d'un .glb (si l'omples, té prioritat)</label>
+  <input id="glburl" value="https://raw.githubusercontent.com/BUFI2424/DON-QUIJOTE/main/knight__ps1_psx.glb" autocomplete="off" spellcheck="false">
+  <button id="go">Començar</button>
+</div>
+<div id="hud"></div>
+<div id="msg"></div>
+
+<script>
+// ------------------------------------------------------------------
+// CONFIGURACIÓ
+// ------------------------------------------------------------------
+const CFG = {
+  walkSpeed: 3.2,      // m/s
+  runSpeed: 7.5,       // m/s (Shift)
+  jumpSpeed: 5.5,      // m/s inicial del salt (~1,5 m d'alçada)
+  gravity: 9.8,
+  lookHeight: 1.2,     // la càmera mira al pit del cavaller
+  modelScale: 1.0,
+};
+
+// Eixos dels ossos (calculats a partir del teu .glb): eix lateral i frontal
+// del cos expressats en l'espai local de cada os.
+const BONES = {
+  LeftUpLeg:  { lat:[-0.85, 0.43, 0.29], fwd:[0.39, 0.17, 0.90] },
+  RightUpLeg: { lat:[-0.99, 0.15,-0.03], fwd:[-0.02,0.07, 1.00] },
+  LeftLeg:    { lat:[-0.89, 0.36, 0.29] },
+  RightLeg:   { lat:[-0.97, 0.21,-0.14] },
+  LeftArm:    { lat:[ 0.65, 0.44,-0.62] },
+  RightArm:   { lat:[ 0.44,-0.60, 0.67] },
+};
+
+// Calibratge (es guarda al navegador)
+const CAL = Object.assign({ vfov: 35, vOffset: 0, yawOffset: 0 }, load('cav_cal2', {}));
+// Google mesura l'alçada sobre el nivell del mar; Cesium sobre l'el·lipsoide.
+// La diferència (geoide) a la península és d'uns 50 m. S'intenta calcular sola.
+let GEOID = 0, geoidSrc = 'fix';
+let modelStatus = 'carregant…', marker;
+
+// ------------------------------------------------------------------
+// ESTAT
+// ------------------------------------------------------------------
+const S = {
+  lat: 0, lon: 0,
+  ground: 0,          // alçada del terra segons Cesium (m, el·lipsoide)
+  agl: 0, vz: 0,      // alçada sobre el terra i velocitat vertical
+  facing: 0,          // cap on mira el cavaller (rad, des del nord, horari)
+  heading: 0, tilt: 72, range: 9,   // càmera orbital
+  phase: 0, walkAmt: 0,
+  keys: {}, showGround: false,
+};
+let viewer, map3d, knight, bones = {}, lastT = performance.now();
+const R = Cesium.Math.toRadians;
+
+// ------------------------------------------------------------------
+// INICI
+// ------------------------------------------------------------------
+['gkey','ctoken','coords','asset','glburl'].forEach(id => {
+  const v = load('cav_'+id, null); if (v) document.getElementById(id).value = v;
+});
+
+document.getElementById('go').onclick = async () => {
+  const gkey = val('gkey'), ctoken = val('ctoken'), coords = val('coords'), asset = val('asset');
+  if (!gkey || !ctoken) return msg('Falten la clau de Google o el token de Cesium', 4000);
+  ['gkey','ctoken','coords','asset','glburl'].forEach(id => save('cav_'+id, val(id)));
+  const [la, lo] = coords.split(',').map(Number);
+  if (!isFinite(la) || !isFinite(lo)) return msg('Coordenades incorrectes', 4000);
+  S.lat = la; S.lon = lo;
+  document.getElementById('panel').style.display = 'none';
+  msg('Carregant…');
+  try {
+    await initGoogle(gkey);
+    await initCesium(ctoken, Number(asset), val('glburl'));
+    initInput();
+    msg('Llest! WASD per caminar', 2500);
+  } catch (e) {
+    console.error(e); msg('Error: ' + e.message, 10000);
+  }
+};
+
+// ---------------- GOOGLE 3D MAPS (només visual) ----------------
+async function initGoogle(key) {
+  // Carregador oficial de Google (el mateix que recomana la documentació)
+  (g=>{var h,a,k,p="The Google Maps JavaScript API",c="google",l="importLibrary",q="__ib__",m=document,b=window;b=b[c]||(b[c]={});var d=b.maps||(b.maps={}),r=new Set,e=new URLSearchParams,u=()=>h||(h=new Promise(async(f,n)=>{await (a=m.createElement("script"));e.set("libraries",[...r]+"");for(k in g)e.set(k.replace(/[A-Z]/g,t=>"_"+t[0].toLowerCase()),g[k]);e.set("callback",c+".maps."+q);a.src=`https://maps.${c}apis.com/maps/api/js?`+e;d[q]=f;a.onerror=()=>h=n(Error(p+" could not load."));a.nonce=m.querySelector("script[nonce]")?.nonce||"";m.head.append(a)}));d[l]?console.warn(p+" only loads once. Ignoring:",g):d[l]=(f,...n)=>r.add(f)&&u().then(()=>d[l](f,...n))})
+  ({ key, v: 'beta' });
+
+  let Map3DElement;
+  try {
+    ({ Map3DElement } = await google.maps.importLibrary('maps3d'));
+  } catch (e) {
+    throw new Error('Google Maps no carrega. Desactiva el bloquejador d\'anuncis per a CodePen i torna-ho a provar.');
+  }
+  map3d = new Map3DElement({
+    center: { lat: S.lat, lng: S.lon, altitude: CFG.lookHeight },
+    range: S.range, tilt: S.tilt, heading: S.heading,
+    mode: 'HYBRID',
+  });
+  try { map3d.defaultUIHidden = true; } catch(e) {}
+  document.getElementById('gmap').append(map3d);
+}
+
+// ---------------- CESIUM (transparent: física + cavaller) ----------------
+async function initCesium(token, assetId, glbUrl) {
+  Cesium.Ion.defaultAccessToken = token;
+  const terrain = await Cesium.createWorldTerrainAsync();
+
+  viewer = new Cesium.Viewer('cesium', {
+    terrainProvider: terrain,
+    baseLayer: false,
+    animation:false, timeline:false, baseLayerPicker:false, geocoder:false, homeButton:false,
+    sceneModePicker:false, navigationHelpButton:false, fullscreenButton:false,
+    infoBox:false, selectionIndicator:false,
+    skyBox:false, skyAtmosphere:false,
+    contextOptions: { webgl: { alpha: true } },
+  });
+  const sc = viewer.scene;
+  sc.backgroundColor = Cesium.Color.TRANSPARENT;
+  sc.globe.baseColor = Cesium.Color.TRANSPARENT;   // terra invisible però present (per les alçades)
+  sc.globe.showGroundAtmosphere = false;
+  sc.globe.enableLighting = false;
+  sc.globe.depthTestAgainstTerrain = false;
+  sc.fog.enabled = false;
+  if (sc.sun) sc.sun.show = false;
+  if (sc.moon) sc.moon.show = false;
+  sc.highDynamicRange = false;
+  sc.screenSpaceCameraController.enableInputs = false;   // la càmera la controlem nosaltres
+  sc.light = new Cesium.DirectionalLight({ direction: new Cesium.Cartesian3(0, 0, -1), intensity: 2.5 });
+
+  // Alçada inicial del terra
+  const [c] = await Cesium.sampleTerrainMostDetailed(terrain, [Cesium.Cartographic.fromDegrees(S.lon, S.lat)]);
+  S.ground = c.height || 0;
+  S.agl = 25; // apareix caient del cel 😉
+
+  // Cavaller
+
+  // Punt groc als peus del cavaller (diagnòstic, tecla P)
+  marker = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground),
+    point: { pixelSize: 12, color: Cesium.Color.YELLOW, outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+             disableDepthTestDistance: Number.POSITIVE_INFINITY },
+  });
+
+  sc.preUpdate.addEventListener(tick);
+
+  try {
+    const res = glbUrl ? new Cesium.Resource({ url: glbUrl }) : await Cesium.IonResource.fromAssetId(assetId);
+    const buf = await res.fetchArrayBuffer();
+    knight = await Cesium.Model.fromGltfAsync({ gltf: fixSkinnedGlb(buf), scale: CFG.modelScale });
+    sc.primitives.add(knight);
+    knight.errorEvent.addEventListener(e => { modelStatus = 'ERROR: ' + (e.message || e); console.error(e); });
+    knight.readyEvent.addEventListener(() => {
+      knight.activeAnimations.addAll({ loop: Cesium.ModelAnimationLoop.REPEAT }); // Idle
+      findBones();
+      modelStatus = `llest · mida ${(knight.boundingSphere.radius * 2).toFixed(2)} m · ossos ${Object.keys(bones).length}/6`;
+    });
+  } catch (e) {
+    modelStatus = 'ERROR carregant: ' + e.message; console.error(e);
+  }
+}
+
+// Cesium no dibuixa bé les malles amb esquelet si el node de la malla té
+// transformació pròpia (com passa amb els models exportats de Sketchfab).
+// Aquí la traiem abans de carregar el model.
+function fixSkinnedGlb(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x46546c67) throw new Error('El fitxer no és un .glb');
+  const jl = dv.getUint32(12, true);
+  const j = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, jl)));
+  const rest = new Uint8Array(buf, 20 + jl);            // la resta de chunks (BIN), intactes
+  const sc = j.scenes[j.scene || 0];
+  j.nodes.forEach((n, i) => {
+    if (n.skin === undefined || n.mesh === undefined) return;
+    j.nodes.forEach(p => { if (p.children) p.children = p.children.filter(c => c !== i); });
+    delete n.matrix; delete n.translation; delete n.rotation; delete n.scale;
+    if (!sc.nodes.includes(i)) sc.nodes.push(i);
+  });
+  let js = new TextEncoder().encode(JSON.stringify(j));
+  const pad = (4 - js.length % 4) % 4;
+  const total = 20 + js.length + pad + rest.length;
+  const out = new Uint8Array(total), o = new DataView(out.buffer);
+  o.setUint32(0, 0x46546c67, true); o.setUint32(4, 2, true); o.setUint32(8, total, true);
+  o.setUint32(12, js.length + pad, true); o.setUint32(16, 0x4E4F534A, true);
+  out.set(js, 20); out.fill(0x20, 20 + js.length, 20 + js.length + pad);
+  out.set(rest, 20 + js.length + pad);
+  return out;
+}
+
+// Diferència nivell del mar ↔ el·lipsoide, amb l'Elevation API de Google (si està activada)
+async function calcGeoid() {
+  try {
+    const { ElevationService } = await google.maps.importLibrary('elevation');
+    const r = await new ElevationService().getElevationForLocations({ locations: [{ lat: S.lat, lng: S.lon }] });
+    const g = S.ground - r.results[0].elevation;
+    if (Math.abs(g) < 120) { GEOID = g; geoidSrc = 'auto'; }
+  } catch (e) { console.warn('Elevation API no disponible, faig servir 51 m', e); }
+}
+
+function findBones() {
+  const all = Object.keys(knight._nodesByName || {});
+  for (const b in BONES) {
+    const name = all.find(n => n.includes(b) && !(b === 'LeftArm' && n.includes('ForeArm')) && !(b === 'RightArm' && n.includes('ForeArm')));
+    const node = name && knight.getNode(name);
+    if (!node) { console.warn('Os no trobat:', b); continue; }
+    const norm = v => Cesium.Cartesian3.normalize(new Cesium.Cartesian3(...v), new Cesium.Cartesian3());
+    bones[b] = { node, lat: norm(BONES[b].lat), fwd: BONES[b].fwd ? norm(BONES[b].fwd) : null };
+  }
+  if (!Object.keys(bones).length) msg('No he trobat l\'esquelet: el cavaller lliscarà sense moure les cames', 6000);
+}
+
+// ------------------------------------------------------------------
+// BUCLE PRINCIPAL
+// ------------------------------------------------------------------
+function tick() {
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  const K = S.keys;
+
+  // --- moviment ---
+  let f = (K.KeyW?1:0) - (K.KeyS?1:0);
+  let r = (K.KeyD?1:0) - (K.KeyA?1:0);
+  const moving = f || r;
+  const run = K.ShiftLeft || K.ShiftRight;
+  const speed = run ? CFG.runSpeed : CFG.walkSpeed;
+  let dist = 0;
+  if (moving) {
+    const bearing = R(S.heading) + Math.atan2(r, f);
+    dist = speed * dt;
+    const north = Math.cos(bearing) * dist, east = Math.sin(bearing) * dist;
+    S.lat += Cesium.Math.toDegrees(north / 6378137);
+    S.lon += Cesium.Math.toDegrees(east / (6378137 * Math.cos(R(S.lat))));
+  }
+  // El cavaller mira cap on apunta el ratolí (direcció de la càmera)
+  S.facing = turnTowards(S.facing, R(S.heading), 12 * dt);
+  if (K.KeyQ) S.heading -= 90 * dt;
+  if (K.KeyE) S.heading += 90 * dt;
+
+  // --- terra i gravetat ---
+  const h = viewer.scene.globe.getHeight(Cesium.Cartographic.fromDegrees(S.lon, S.lat));
+  if (h !== undefined) S.ground = h;
+  S.vz -= CFG.gravity * dt;
+  S.agl += S.vz * dt;
+  const onGround = S.agl <= 0;
+  if (onGround) { S.agl = 0; S.vz = 0; }
+  if (K.Space && onGround) S.vz = CFG.jumpSpeed;
+
+  // --- animació procedural ---
+  const target = moving && onGround ? 1 : 0;
+  S.walkAmt += (target - S.walkAmt) * Math.min(1, 8 * dt);
+  S.phase += dist / (run ? 2.4 : 1.6) * Math.PI * 2;
+  animateBones(run, onGround);
+
+  // --- posició del cavaller ---
+  const bob = 0.05 * S.walkAmt * Math.cos(2 * S.phase);
+  const pos = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + S.agl + bob);
+  const hpr = new Cesium.HeadingPitchRoll(S.facing - Math.PI / 2 + R(CAL.yawOffset), 0, 0);
+  if (knight) knight.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(pos, hpr);
+  if (marker) marker.position = pos;
+
+  // --- càmeres sincronitzades ---
+  syncCameras();
+  updateHud(onGround);
+}
+
+function animateBones(run, onGround) {
+  if (!knight || !knight.ready) return;
+  const a = S.walkAmt, p = S.phase;
+  const air = onGround ? 0 : 1;
+  if (a < 0.01 && !air) {           // quiet: torna el control a l'animació Idle
+    for (const b in bones) if (bones[b].active) { bones[b].node.matrix = undefined; bones[b].active = false; }
+    return;
+  }
+  const A = R(run ? 45 : 28) * a, Kn = R(run ? 65 : 38) * a, ADD = R(10) * a;
+  const s = Math.sin(p), c = Math.cos(p);
+  const pose = {
+    LeftUpLeg:  { sw: -A * s - R(25) * air, ad: -ADD },
+    RightUpLeg: { sw:  A * s - R(25) * air, ad:  ADD },
+    LeftLeg:    { sw: Kn * Math.max(0,  c) + R(50) * air },
+    RightLeg:   { sw: Kn * Math.max(0, -c) + R(50) * air },
+    LeftArm:    { sw:  A * 0.7 * s },
+    RightArm:   { sw: -A * 0.2 * s },   // porta l'espasa: es mou poc
+  };
+  for (const b in bones) {
+    const B = bones[b], P = pose[b];
+    let q = Cesium.Quaternion.fromAxisAngle(B.lat, P.sw);
+    if (B.fwd && P.ad) q = Cesium.Quaternion.multiply(q, Cesium.Quaternion.fromAxisAngle(B.fwd, P.ad), new Cesium.Quaternion());
+    const rot = Cesium.Matrix4.fromRotation(Cesium.Matrix3.fromQuaternion(q));
+    B.node.matrix = Cesium.Matrix4.multiply(B.node.originalMatrix, rot, new Cesium.Matrix4());
+    B.active = true;
+  }
+}
+
+function syncCameras() {
+  S.tilt = Cesium.Math.clamp(S.tilt, 5, 89);
+  S.range = Cesium.Math.clamp(S.range, 2.5, 80);
+
+  // Google: l'alçada del centre és sobre el NIVELL DEL MAR
+  if (map3d) {
+    const alt = S.ground - GEOID + S.agl + CFG.lookHeight + CAL.vOffset;
+    map3d.center = { lat: S.lat, lng: S.lon, altitude: alt };
+    map3d.heading = ((S.heading % 360) + 360) % 360;
+    map3d.tilt = S.tilt;
+    map3d.range = S.range;
+    map3d.fov = CAL.vfov;                       // mateix camp de visió vertical que Cesium
+  }
+
+  // Cesium: mateixa càmera, sobre el terra de Cesium
+  const cam = viewer.camera;
+  const aspect = viewer.canvas.clientWidth / Math.max(1, viewer.canvas.clientHeight);
+  const v = R(CAL.vfov);
+  cam.frustum.fov = aspect > 1 ? 2 * Math.atan(Math.tan(v / 2) * aspect) : v;
+  const t = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + S.agl + CFG.lookHeight);
+  cam.lookAt(t, new Cesium.HeadingPitchRange(R(S.heading), -R(90 - S.tilt), S.range));
+  cam.lookAtTransform(Cesium.Matrix4.IDENTITY);
+  viewer.scene.light.direction = Cesium.Cartesian3.clone(cam.directionWC, viewer.scene.light.direction);
+}
+
+// ------------------------------------------------------------------
+// CONTROLS
+// ------------------------------------------------------------------
+function initInput() {
+  document.getElementById('hud').style.display = 'block';
+  addEventListener('keydown', e => {
+    S.keys[e.code] = true;
+    if (['Space','PageUp','PageDown'].includes(e.code)) e.preventDefault();
+    if (e.code === 'BracketLeft')  { CAL.vfov = Math.max(10, CAL.vfov - 1); saveCal(); }
+    if (e.code === 'BracketRight') { CAL.vfov = Math.min(100, CAL.vfov + 1); saveCal(); }
+    const step = e.shiftKey ? 5 : 0.5;
+    if (e.code === 'PageUp')   { CAL.vOffset += step; saveCal(); }
+    if (e.code === 'PageDown') { CAL.vOffset -= step; saveCal(); }
+    if (e.code === 'KeyP' && marker) marker.show = !marker.show;
+    if (knight && (e.code === 'Equal' || e.code === 'NumpadAdd'))      knight.scale *= 10;
+    if (knight && (e.code === 'Minus' || e.code === 'NumpadSubtract')) knight.scale /= 10;
+    if (e.code === 'KeyR') { CAL.yawOffset = (CAL.yawOffset + 90) % 360; saveCal(); }
+    if (e.code === 'KeyG') {
+      S.showGround = !S.showGround;
+      viewer.scene.globe.baseColor = S.showGround ? new Cesium.Color(1, 0.2, 0.2, 0.35) : Cesium.Color.TRANSPARENT;
+    }
+    if (e.code === 'KeyM') {
+      if (document.pointerLockElement) document.exitPointerLock();
+      else viewer.canvas.requestPointerLock();
+    }
+  });
+  addEventListener('keyup', e => S.keys[e.code] = false);
+  addEventListener('blur', () => S.keys = {});
+
+  const cv = viewer.canvas; let drag = false;
+  cv.addEventListener('pointerdown', () => { drag = true; if (!document.pointerLockElement) cv.requestPointerLock(); });
+  addEventListener('pointerup', () => drag = false);
+  addEventListener('mousemove', e => {
+    if (!drag && document.pointerLockElement !== cv) return;
+    S.heading += e.movementX * 0.25;
+    S.tilt    += e.movementY * 0.2;
+  });
+  cv.addEventListener('wheel', e => { e.preventDefault(); S.range *= e.deltaY > 0 ? 1.1 : 0.9; }, { passive:false });
+}
+
+function updateHud(onGround) {
+  document.getElementById('hud').textContent =
+`WASD caminar · Shift córrer · Espai saltar
+Clic: el ratolí dirigeix el cavaller · Esc: deixar-lo anar · Roda zoom
+Q / E girar càmera
+
+CALIBRATGE
+[ ]   FOV: ${CAL.vfov}°
+PgUp/PgDn alçada: ${CAL.vOffset.toFixed(1)} m (Shift: ×10)
+R     girar model: ${CAL.yawOffset}°
+G     veure terra Cesium: ${S.showGround ? 'sí' : 'no'}
+P     punt groc als peus
+geoide: ${GEOID.toFixed(1)} m (${geoidSrc})
+
+CAVALLER: ${modelStatus}
+escala: ${knight ? knight.scale : '-'}  (+ / -)
+
+${S.lat.toFixed(6)}, ${S.lon.toFixed(6)}  ${onGround ? '' : '(a l\'aire)'}`;
+}
+
+// ------------------------------------------------------------------
+// UTILITATS
+// ------------------------------------------------------------------
+function turnTowards(a, b, k) {
+  let d = ((b - a + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+  return a + d * Math.min(1, k);
+}
+function val(id) { return document.getElementById(id).value.trim(); }
+function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : (k === 'cav_cal2' ? JSON.parse(v) : v); } catch(e) { return d; } }
+function save(k, v) { try { localStorage.setItem(k, v); } catch(e) {} }
+function saveCal() { save('cav_cal2', JSON.stringify(CAL)); }
+let msgT;
+function msg(t, ms) {
+  const m = document.getElementById('msg'); m.textContent = t; m.style.display = 'block';
+  clearTimeout(msgT); if (ms) msgT = setTimeout(() => m.style.display = 'none', ms);
+}
+</script>
