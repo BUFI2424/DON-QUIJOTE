@@ -422,9 +422,19 @@ function syncCameras() {
   const aspect = viewer.canvas.clientWidth / Math.max(1, viewer.canvas.clientHeight);
   const v = R(CAL.vfov);
   cam.frustum.fov = aspect > 1 ? 2 * Math.atan(Math.tan(v / 2) * aspect) : v;
-  const t = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + S.agl + CFG.lookHeight);
-  cam.lookAt(t, new Cesium.HeadingPitchRange(R(S.heading), -R(90 - S.tilt), S.range));
-  cam.lookAtTransform(Cesium.Matrix4.IDENTITY);
+  // Google no deixa baixar la càmera a tocar de terra i la puja pel seu compte.
+  // Per això copiem la càmera REAL de Google (cameraPosition) en lloc de calcular-la.
+  const cp = map3d && map3d.cameraPosition;
+  if (cp && isFinite(cp.altitude)) {
+    cam.setView({
+      destination: Cesium.Cartesian3.fromDegrees(cp.lng, cp.lat, cp.altitude - CAL.vOffset),
+      orientation: { heading: R(map3d.heading || 0), pitch: R((map3d.tilt || 0) - 90), roll: R(map3d.roll || 0) },
+    });
+  } else {
+    const t = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + S.agl + CFG.lookHeight);
+    cam.lookAt(t, new Cesium.HeadingPitchRange(R(S.heading), -R(90 - S.tilt), S.range));
+    cam.lookAtTransform(Cesium.Matrix4.IDENTITY);
+  }
   viewer.scene.light.direction = Cesium.Cartesian3.clone(cam.directionWC, viewer.scene.light.direction);
 }
 
