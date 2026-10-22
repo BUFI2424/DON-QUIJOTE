@@ -36,7 +36,7 @@
   <label>Cesium ion token</label>
   <input id="ctoken" type="text" autocomplete="off" spellcheck="false">
   <label>Coordenades d'inici (lat, lon)</label>
-  <input id="coords" value="40.075666, -2.123075">
+  <input id="coords" value="39.97508693293566, -4.924448146465163">
   <label>ID de l'asset del cavaller (Cesium ion)</label>
   <input id="asset" value="6069389">
   <label>…o URL directa d'un .glb (si l'omples, té prioritat)</label>
@@ -51,12 +51,16 @@
 // CONFIGURACIÓ
 // ------------------------------------------------------------------
 const CFG = {
-  walkSpeed: 3.2,      // m/s
-  runSpeed: 7.5,       // m/s (Shift)
-  jumpSpeed: 5.5,      // m/s inicial del salt (~1,5 m d'alçada)
+  walkSpeed: 5,        // m/s
+  runSpeed: 11,        // m/s (Shift)
+  jumpSpeed: 6,        // m/s inicial del salt
   gravity: 9.8,
-  lookHeight: 1.2,     // la càmera mira al pit del cavaller
-  modelScale: 1.0,
+  modelScale: 1.5,     // mida del cavaller (1 = 1,8 m)
+  lookHeight: 1.8,     // la càmera mira al pit del cavaller
+  turnSpeed: 10,       // com de ràpid es gira cap on camina
+  mouseSens: 0.18,
+  walkStride: 2.6,     // metres per cicle de passes
+  runStride: 3.8,
 };
 
 // Eixos dels ossos (calculats a partir del teu .glb): eix lateral i frontal
@@ -72,9 +76,10 @@ const BONES = {
 
 // Calibratge (es guarda al navegador)
 const CAL = Object.assign({ vfov: 35, vOffset: 0, yawOffset: 0 }, load('cav_cal2', {}));
-// Google mesura l'alçada sobre el nivell del mar; Cesium sobre l'el·lipsoide.
-// La diferència (geoide) a la península és d'uns 50 m. S'intenta calcular sola.
-let GEOID = 0, geoidSrc = 'fix';
+// L'Elevation API dona l'alçada sobre el nivell del mar, però la càmera de
+// Google 3D funciona sobre l'el·lipsoide: la diferència (geoide) a la península
+// és d'uns 50 m. Es calcula a l'inici comparant amb Cesium (si hi ha token).
+let GEOID = 51, geoidSrc = 'aprox.';
 let modelStatus = 'carregant…', marker;
 
 // ------------------------------------------------------------------
@@ -82,10 +87,10 @@ let modelStatus = 'carregant…', marker;
 // ------------------------------------------------------------------
 const S = {
   lat: 0, lon: 0,
-  ground: 0,          // alçada del terra segons Cesium (m, el·lipsoide)
+  ground: 0,          // alçada del terra sobre el nivell del mar (Elevation API)
   agl: 0, vz: 0,      // alçada sobre el terra i velocitat vertical
   facing: 0,          // cap on mira el cavaller (rad, des del nord, horari)
-  heading: 0, tilt: 72, range: 9,   // càmera orbital
+  heading: 0, tilt: 70, range: 14,  // càmera orbital
   phase: 0, walkAmt: 0,
   keys: {}, showGround: false,
 };
@@ -101,7 +106,8 @@ const R = Cesium.Math.toRadians;
 
 document.getElementById('go').onclick = async () => {
   const gkey = val('gkey'), ctoken = val('ctoken'), coords = val('coords'), asset = val('asset');
-  if (!gkey || !ctoken) return msg('Falten la clau de Google o el token de Cesium', 4000);
+  if (!gkey) return msg('Falta la clau de Google', 4000);
+  if (!ctoken && !val('glburl')) return msg('Cal el token de Cesium o una URL de .glb', 4000);
   ['gkey','ctoken','coords','asset','glburl'].forEach(id => save('cav_'+id, val(id)));
   const [la, lo] = coords.split(',').map(Number);
   if (!isFinite(la) || !isFinite(lo)) return msg('Coordenades incorrectes', 4000);
@@ -141,11 +147,10 @@ async function initGoogle(key) {
 
 // ---------------- CESIUM (transparent: física + cavaller) ----------------
 async function initCesium(token, assetId, glbUrl) {
-  Cesium.Ion.defaultAccessToken = token;
-  const terrain = await Cesium.createWorldTerrainAsync();
+  if (token) Cesium.Ion.defaultAccessToken = token;
 
   viewer = new Cesium.Viewer('cesium', {
-    terrainProvider: terrain,
+    terrainProvider: new Cesium.EllipsoidTerrainProvider(),   // el terra el dona Google
     baseLayer: false,
     animation:false, timeline:false, baseLayerPicker:false, geocoder:false, homeButton:false,
     sceneModePicker:false, navigationHelpButton:false, fullscreenButton:false,
@@ -155,7 +160,8 @@ async function initCesium(token, assetId, glbUrl) {
   });
   const sc = viewer.scene;
   sc.backgroundColor = Cesium.Color.TRANSPARENT;
-  sc.globe.baseColor = Cesium.Color.TRANSPARENT;   // terra invisible però present (per les alçades)
+  sc.globe.baseColor = Cesium.Color.TRANSPARENT;
+  sc.globe.show = false;                            // Cesium només dibuixa el cavaller
   sc.globe.showGroundAtmosphere = false;
   sc.globe.enableLighting = false;
   sc.globe.depthTestAgainstTerrain = false;
@@ -166,9 +172,15 @@ async function initCesium(token, assetId, glbUrl) {
   sc.screenSpaceCameraController.enableInputs = false;   // la càmera la controlem nosaltres
   sc.light = new Cesium.DirectionalLight({ direction: new Cesium.Cartesian3(0, 0, -1), intensity: 2.5 });
 
-  // Alçada inicial del terra
-  const [c] = await Cesium.sampleTerrainMostDetailed(terrain, [Cesium.Cartographic.fromDegrees(S.lon, S.lat)]);
-  S.ground = c.height || 0;
+  // Alçada inicial del terra (Google Elevation API)
+  await fetchGrid();
+  S.ground = sampleGround(S.lat, S.lon) ?? 0;
+  if (token) try {
+    const wt = await Cesium.createWorldTerrainAsync();
+    const [c] = await Cesium.sampleTerrainMostDetailed(wt, [Cesium.Cartographic.fromDegrees(S.lon, S.lat)]);
+    const g = c.height - S.ground;
+    if (Math.abs(g) < 120) { GEOID = g; geoidSrc = 'auto'; }
+  } catch (e) { console.warn('No he pogut calcular el geoide', e); }
   S.agl = 25; // apareix caient del cel 😉
 
   // Cavaller
@@ -178,6 +190,7 @@ async function initCesium(token, assetId, glbUrl) {
     position: Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground),
     point: { pixelSize: 12, color: Cesium.Color.YELLOW, outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
              disableDepthTestDistance: Number.POSITIVE_INFINITY },
+    show: false,
   });
 
   sc.preUpdate.addEventListener(tick);
@@ -225,14 +238,46 @@ function fixSkinnedGlb(buf) {
   return out;
 }
 
-// Diferència nivell del mar ↔ el·lipsoide, amb l'Elevation API de Google (si està activada)
-async function calcGeoid() {
+// ------------------------------------------------------------------
+// TERRA: alçades de Google (Elevation API), en una graella al voltant del
+// cavaller. Una sola petició porta 81 punts; només se'n fa una de nova quan
+// el cavaller s'acosta a la vora. Si Google falla, es fa servir Open-Meteo.
+// ------------------------------------------------------------------
+const GRID = { n: 9, step: 5, lat0: 0, lon0: 0, h: null, busy: false, src: '…' };
+let elevSvc = null;
+async function fetchGrid() {
+  if (GRID.busy) return;
+  GRID.busy = true;
+  const n = GRID.n, half = (n - 1) / 2, lat0 = S.lat, lon0 = S.lon;
+  const mLat = 1 / 111320, mLon = 1 / (111320 * Math.cos(R(lat0)));
+  const locs = [];
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++)
+    locs.push({ lat: lat0 + (y - half) * GRID.step * mLat, lng: lon0 + (x - half) * GRID.step * mLon });
+  let h = null;
   try {
-    const { ElevationService } = await google.maps.importLibrary('elevation');
-    const r = await new ElevationService().getElevationForLocations({ locations: [{ lat: S.lat, lng: S.lon }] });
-    const g = S.ground - r.results[0].elevation;
-    if (Math.abs(g) < 120) { GEOID = g; geoidSrc = 'auto'; }
-  } catch (e) { console.warn('Elevation API no disponible, faig servir 51 m', e); }
+    if (!elevSvc) { const { ElevationService } = await google.maps.importLibrary('elevation'); elevSvc = new ElevationService(); }
+    const r = await elevSvc.getElevationForLocations({ locations: locs });
+    h = r.results.map(x => x.elevation); GRID.src = 'Google';
+  } catch (e) {
+    try {
+      const lats = locs.map(l => l.lat.toFixed(6)).join(','), lons = locs.map(l => l.lng.toFixed(6)).join(',');
+      const r = await (await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`)).json();
+      h = r.elevation; GRID.src = 'Open-Meteo (Google ha fallat)';
+    } catch (e2) { GRID.src = 'cap'; }
+  }
+  if (h) { GRID.h = h; GRID.lat0 = lat0; GRID.lon0 = lon0; }
+  GRID.busy = false;
+}
+function sampleGround(lat, lon) {
+  if (!GRID.h) return null;
+  const n = GRID.n, half = (n - 1) / 2;
+  const gx = (lon - GRID.lon0) * 111320 * Math.cos(R(GRID.lat0)) / GRID.step + half;
+  const gy = (lat - GRID.lat0) * 111320 / GRID.step + half;
+  if (gx < 2 || gy < 2 || gx > n - 3 || gy > n - 3) fetchGrid();   // a prop de la vora: en demana una de nova
+  const x = Cesium.Math.clamp(gx, 0, n - 1.001), y = Cesium.Math.clamp(gy, 0, n - 1.001);
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0, H = GRID.h;
+  const a = H[y0 * n + x0], b = H[y0 * n + x0 + 1], c = H[(y0 + 1) * n + x0], d = H[(y0 + 1) * n + x0 + 1];
+  return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
 }
 
 function findBones() {
@@ -268,15 +313,15 @@ function tick() {
     const north = Math.cos(bearing) * dist, east = Math.sin(bearing) * dist;
     S.lat += Cesium.Math.toDegrees(north / 6378137);
     S.lon += Cesium.Math.toDegrees(east / (6378137 * Math.cos(R(S.lat))));
+    // estil Assassin's Creed: el cavaller es gira cap a on camina
+    S.facing = turnTowards(S.facing, bearing, CFG.turnSpeed * dt);
   }
-  // El cavaller mira cap on apunta el ratolí (direcció de la càmera)
-  S.facing = turnTowards(S.facing, R(S.heading), 12 * dt);
   if (K.KeyQ) S.heading -= 90 * dt;
   if (K.KeyE) S.heading += 90 * dt;
 
   // --- terra i gravetat ---
-  const h = viewer.scene.globe.getHeight(Cesium.Cartographic.fromDegrees(S.lon, S.lat));
-  if (h !== undefined) S.ground = h;
+  const h = sampleGround(S.lat, S.lon);
+  if (h !== null) S.ground += (h - S.ground) * Math.min(1, 15 * dt);
   S.vz -= CFG.gravity * dt;
   S.agl += S.vz * dt;
   const onGround = S.agl <= 0;
@@ -286,7 +331,7 @@ function tick() {
   // --- animació procedural ---
   const target = moving && onGround ? 1 : 0;
   S.walkAmt += (target - S.walkAmt) * Math.min(1, 8 * dt);
-  S.phase += dist / (run ? 2.4 : 1.6) * Math.PI * 2;
+  S.phase += dist / (run ? CFG.runStride : CFG.walkStride) * Math.PI * 2;
   animateBones(run, onGround);
 
   // --- posició del cavaller ---
@@ -335,7 +380,7 @@ function syncCameras() {
 
   // Google: l'alçada del centre és sobre el NIVELL DEL MAR
   if (map3d) {
-    const alt = S.ground - GEOID + S.agl + CFG.lookHeight + CAL.vOffset;
+    const alt = S.ground + GEOID + S.agl + CFG.lookHeight + CAL.vOffset;
     map3d.center = { lat: S.lat, lng: S.lon, altitude: alt };
     map3d.heading = ((S.heading % 360) + 360) % 360;
     map3d.tilt = S.tilt;
@@ -388,8 +433,8 @@ function initInput() {
   addEventListener('pointerup', () => drag = false);
   addEventListener('mousemove', e => {
     if (!drag && document.pointerLockElement !== cv) return;
-    S.heading += e.movementX * 0.25;
-    S.tilt    += e.movementY * 0.2;
+    S.heading += e.movementX * CFG.mouseSens;
+    S.tilt    -= e.movementY * CFG.mouseSens;
   });
   cv.addEventListener('wheel', e => { e.preventDefault(); S.range *= e.deltaY > 0 ? 1.1 : 0.9; }, { passive:false });
 }
@@ -406,7 +451,7 @@ PgUp/PgDn alçada: ${CAL.vOffset.toFixed(1)} m (Shift: ×10)
 R     girar model: ${CAL.yawOffset}°
 G     veure terra Cesium: ${S.showGround ? 'sí' : 'no'}
 P     punt groc als peus
-geoide: ${GEOID.toFixed(1)} m (${geoidSrc})
+terra: ${S.ground.toFixed(1)} m (${GRID.src}) · geoide ${GEOID.toFixed(1)} m (${geoidSrc})
 
 CAVALLER: ${modelStatus}
 escala: ${knight ? knight.scale : '-'}  (+ / -)
