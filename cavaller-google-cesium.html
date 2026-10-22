@@ -309,6 +309,66 @@ function sampleGround(lat, lon) {
   return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
 }
 
+// ------------------------------------------------------------------
+// CAIGUDA A L'ABISME (tecla Ñ)
+// ------------------------------------------------------------------
+const FALL = { on: false, ready: false, switched: false, t: 0, off: 0, hole: null, terrain: null, layer: null };
+
+async function startFall() {
+  FALL.on = true; FALL.ready = false; FALL.switched = false; FALL.t = 0; S.vz = 0; S.agl = 0;
+  const lat = S.lat, lon = S.lon;
+  // forat negre que s'obre sota els peus
+  FALL.hole = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(lon, lat, S.ground),
+    ellipse: {
+      semiMajorAxis: new Cesium.CallbackProperty(() => Math.max(0.05, Math.min(3.2, FALL.t * 5)), false),
+      semiMinorAxis: new Cesium.CallbackProperty(() => Math.max(0.05, Math.min(3.2, FALL.t * 5)), false),
+      height: new Cesium.CallbackProperty(() => S.ground + FALL.off + 0.08, false),
+      material: Cesium.Color.BLACK,
+    },
+  });
+  // terreny i imatges de Cesium per veure el món des de sota
+  try {
+    if (!FALL.terrain) FALL.terrain = await Cesium.createWorldTerrainAsync();
+    const [c] = await Cesium.sampleTerrainMostDetailed(FALL.terrain, [Cesium.Cartographic.fromDegrees(lon, lat)]);
+    FALL.off = (c.height || S.ground) - S.ground;          // alinea el terra de Cesium amb el de Google
+    viewer.scene.terrainProvider = FALL.terrain;
+    if (!FALL.layer) FALL.layer = viewer.imageryLayers.addImageryProvider(await Cesium.IonImageryProvider.fromAssetId(2));
+  } catch (e) {
+    console.warn('Sense terreny de Cesium (cal el token d\'ion):', e);
+    msg('Sense el token de Cesium no es pot veure el terreny des de sota', 5000);
+  }
+  if (!FALL.on) return;                                   // s'ha cancel·lat mentre carregava
+  const g = viewer.scene.globe;
+  g.baseColor = Cesium.Color.fromCssColorString('#3a3226');
+  g.translucency.enabled = true;
+  g.translucency.frontFaceAlpha = 0;                      // encara invisible: Google mana
+  g.translucency.backFaceAlpha = 0;
+  g.show = true;                                          // comença a carregar
+  FALL.ready = true;
+}
+
+function switchToAbyss() {
+  FALL.switched = true;
+  const g = viewer.scene.globe;
+  g.translucency.frontFaceAlpha = 1;
+  g.translucency.backFaceAlpha = 1;
+  g.undergroundColor = Cesium.Color.fromCssColorString('#120d08');
+  viewer.scene.backgroundColor = Cesium.Color.BLACK;
+  document.getElementById('gmap').style.opacity = 0;
+  S.tilt = Math.max(S.tilt, 100);                          // mira una mica amunt: es veu el terra des de sota
+}
+
+function resetFall() {
+  FALL.on = false; FALL.ready = false; FALL.switched = false; FALL.off = 0;
+  if (FALL.hole) { viewer.entities.remove(FALL.hole); FALL.hole = null; }
+  const g = viewer.scene.globe;
+  g.show = false; g.translucency.enabled = false; g.baseColor = Cesium.Color.TRANSPARENT;
+  viewer.scene.backgroundColor = Cesium.Color.TRANSPARENT;
+  document.getElementById('gmap').style.opacity = 1;
+  S.agl = 25; S.vz = 0; S.tilt = 70;                       // torna a caure del cel, al mateix lloc
+}
+
 function findBones() {
   const all = Object.keys(knight._nodesByName || {});
   for (const b in BONES) {
@@ -332,7 +392,7 @@ function tick() {
   // --- moviment ---
   let f = (K.KeyW?1:0) - (K.KeyS?1:0);
   let r = (K.KeyD?1:0) - (K.KeyA?1:0);
-  const moving = f || r;
+  const moving = (f || r) && !FALL.on;
   const run = K.ShiftLeft || K.ShiftRight;
   const speed = run ? CFG.runSpeed : CFG.walkSpeed;
   let dist = 0;
@@ -349,13 +409,24 @@ function tick() {
   if (K.KeyE) S.heading += 90 * dt;
 
   // --- terra i gravetat ---
-  const h = sampleGround(S.lat, S.lon);
-  if (h !== null) S.ground += (h - S.ground) * Math.min(1, 15 * dt);
-  S.vz -= CFG.gravity * dt;
-  S.agl += S.vz * dt;
-  const onGround = S.agl <= 0;
-  if (onGround) { S.agl = 0; S.vz = 0; }
-  if (K.Space && onGround) S.vz = CFG.jumpSpeed;
+  let onGround;
+  if (FALL.on) {
+    // caiguda a l'abisme: el forat s'obre i després no hi ha terra
+    FALL.t += dt;
+    if (FALL.ready && FALL.t > 0.7) {
+      S.vz = Math.max(-60, S.vz - CFG.gravity * dt);
+      S.agl += S.vz * dt;
+    }
+    onGround = false;
+  } else {
+    const h = sampleGround(S.lat, S.lon);
+    if (h !== null) S.ground += (h - S.ground) * Math.min(1, 15 * dt);
+    S.vz -= CFG.gravity * dt;
+    S.agl += S.vz * dt;
+    onGround = S.agl <= 0;
+    if (onGround) { S.agl = 0; S.vz = 0; }
+    if (K.Space && onGround) S.vz = CFG.jumpSpeed;
+  }
 
   // --- animació procedural ---
   const target = moving && onGround ? 1 : 0;
@@ -365,7 +436,7 @@ function tick() {
 
   // --- posició del cavaller ---
   const bob = 0.05 * S.walkAmt * Math.cos(2 * S.phase);
-  const pos = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + S.agl + bob);
+  const pos = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + FALL.off + S.agl + bob);
   const hpr = new Cesium.HeadingPitchRoll(S.facing - Math.PI / 2 + R(CAL.yawOffset), 0, 0);
   if (knight) knight.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(pos, hpr);
   if (marker) marker.position = pos;
@@ -404,16 +475,28 @@ function animateBones(run, onGround) {
 }
 
 function syncCameras() {
-  S.tilt = Cesium.Math.clamp(S.tilt, 5, 89);
+  S.tilt = Cesium.Math.clamp(S.tilt, 5, 125);
   S.range = Cesium.Math.clamp(S.range, 2.5, 80);
 
+  // Mirar amunt (inclinació > 90°): com als videojocs, el punt on mira la càmera
+  // puja per sobre del cap i la càmera s'acosta perquè no quedi sota terra.
+  const upDeg = Math.max(0, S.tilt - 90);
+  const lookH = CFG.lookHeight + upDeg * 0.04;
+  let range = S.range;
+  const cosT = Math.cos(R(S.tilt));
+  if (cosT < 0 && !FALL.switched) range = Math.max(1.5, Math.min(range, (lookH - 0.6) / -cosT));
+
+  // Caiguda: quan la càmera hauria de passar per sota del terra, Google ja no
+  // la pot seguir. Llavors amaguem Google i Cesium dibuixa el terreny (vist des de sota).
+  if (FALL.on && FALL.ready && !FALL.switched && S.agl + lookH + range * cosT < 0.5) switchToAbyss();
+
   // Google: l'alçada del centre és sobre el NIVELL DEL MAR
-  if (map3d) {
-    const alt = S.ground + S.agl + CFG.lookHeight + CAL.vOffset;   // Google: sobre el nivell del mar, com l'Elevation API
+  if (map3d && !FALL.switched) {
+    const alt = S.ground + S.agl + lookH + CAL.vOffset;   // Google: sobre el nivell del mar, com l'Elevation API
     map3d.center = { lat: S.lat, lng: S.lon, altitude: alt };
     map3d.heading = ((S.heading % 360) + 360) % 360;
     map3d.tilt = S.tilt;
-    map3d.range = S.range;
+    map3d.range = range;
     map3d.fov = CAL.vfov;                       // mateix camp de visió vertical que Cesium
   }
 
@@ -424,15 +507,21 @@ function syncCameras() {
   cam.frustum.fov = aspect > 1 ? 2 * Math.atan(Math.tan(v / 2) * aspect) : v;
   // Google no deixa baixar la càmera a tocar de terra i la puja pel seu compte.
   // Per això copiem la càmera REAL de Google (cameraPosition) en lloc de calcular-la.
+  // Google sempre mira al centre (el cavaller), així que orientem la càmera de
+  // Cesium des d'aquella posició cap al cavaller: queda centrat encara que Google
+  // hagi mogut la càmera.
   const cp = map3d && map3d.cameraPosition;
-  if (cp && isFinite(cp.altitude)) {
-    cam.setView({
-      destination: Cesium.Cartesian3.fromDegrees(cp.lng, cp.lat, cp.altitude - CAL.vOffset),
-      orientation: { heading: R(map3d.heading || 0), pitch: R((map3d.tilt || 0) - 90), roll: R(map3d.roll || 0) },
-    });
+  if (cp && isFinite(cp.altitude) && !FALL.switched) {
+    const P = Cesium.Cartesian3.fromDegrees(cp.lng, cp.lat, cp.altitude - CAL.vOffset + FALL.off);
+    const T = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + FALL.off + S.agl + lookH);
+    const dir = Cesium.Cartesian3.normalize(Cesium.Cartesian3.subtract(T, P, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+    const nrm = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(P, new Cesium.Cartesian3());
+    const up = Cesium.Cartesian3.normalize(Cesium.Cartesian3.subtract(nrm,
+      Cesium.Cartesian3.multiplyByScalar(dir, Cesium.Cartesian3.dot(nrm, dir), new Cesium.Cartesian3()), new Cesium.Cartesian3()), new Cesium.Cartesian3());
+    cam.setView({ destination: P, orientation: { direction: dir, up } });
   } else {
-    const t = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + S.agl + CFG.lookHeight);
-    cam.lookAt(t, new Cesium.HeadingPitchRange(R(S.heading), -R(90 - S.tilt), S.range));
+    const t = Cesium.Cartesian3.fromDegrees(S.lon, S.lat, S.ground + FALL.off + S.agl + lookH);
+    cam.lookAt(t, new Cesium.HeadingPitchRange(R(S.heading), -R(90 - S.tilt), range));
     cam.lookAtTransform(Cesium.Matrix4.IDENTITY);
   }
   viewer.scene.light.direction = Cesium.Cartesian3.clone(cam.directionWC, viewer.scene.light.direction);
@@ -459,6 +548,7 @@ function initInput() {
       S.showGround = !S.showGround;
       viewer.scene.globe.baseColor = S.showGround ? new Cesium.Color(1, 0.2, 0.2, 0.35) : Cesium.Color.TRANSPARENT;
     }
+    if (e.key === 'ñ' || e.key === 'Ñ' || e.code === 'Semicolon') { FALL.on ? resetFall() : startFall(); }
     if (e.code === 'KeyM') {
       if (document.pointerLockElement) document.exitPointerLock();
       else viewer.canvas.requestPointerLock();
@@ -489,6 +579,7 @@ CALIBRATGE
 PgUp/PgDn alçada: ${CAL.vOffset.toFixed(1)} m (Shift: ×10)
 R     girar model: ${CAL.yawOffset}°
 G     veure terra Cesium: ${S.showGround ? 'sí' : 'no'}
+Ñ     caure a l'abisme / tornar a dalt
 P     punt groc als peus
 terra: ${S.ground.toFixed(1)} m (${GRID.src})
 
