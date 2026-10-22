@@ -1,0 +1,284 @@
+<!-- ============================================================
+  CAVALLER A GOOGLE 3D MAPS — versió només Google
+  Enganxa TOT això al panell HTML de CodePen.
+  Cal: Maps JavaScript API + Map Tiles (3D) + Elevation API activades.
+============================================================ -->
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#000; font-family:system-ui, sans-serif; }
+  #gmap  { position:absolute; inset:0; z-index:1; }
+  #input { position:absolute; inset:0; z-index:2; cursor:crosshair; }   /* captura ratolí i teclat */
+  #panel {
+    position:absolute; z-index:10; top:16px; left:16px; width:320px;
+    background:rgba(20,20,28,.92); color:#eee; padding:14px; border-radius:10px;
+  }
+  #panel label { display:block; font-size:12px; margin:8px 0 3px; color:#aab; }
+  #panel input { width:100%; box-sizing:border-box; padding:6px; border-radius:6px; border:1px solid #445; background:#111; color:#fff; }
+  #panel button { margin-top:12px; width:100%; padding:8px; border:0; border-radius:6px; background:#c9a227; color:#000; font-weight:600; cursor:pointer; }
+  #hud {
+    position:absolute; z-index:10; top:12px; right:12px; display:none; pointer-events:none;
+    background:rgba(0,0,0,.6); color:#fff; padding:10px 12px; border-radius:8px; font-size:12px; line-height:1.5; white-space:pre;
+  }
+  #msg { position:absolute; z-index:11; bottom:40px; left:50%; transform:translateX(-50%); pointer-events:none;
+    background:rgba(0,0,0,.75); color:#fff; padding:8px 14px; border-radius:8px; font-size:13px; display:none; }
+</style>
+
+<div id="gmap"></div>
+<div id="input"></div>
+
+<div id="panel">
+  <b>🛡️ Cavaller a Google 3D</b>
+  <label>Google Maps API key</label>
+  <input id="gkey" type="text" autocomplete="off" spellcheck="false">
+  <label>Coordenades d'inici (lat, lon)</label>
+  <input id="coords" value="40.075666, -2.123075">
+  <label>Carpeta dels fotogrames del cavaller</label>
+  <input id="base" value="https://raw.githubusercontent.com/BUFI2424/DON-QUIJOTE/main/" autocomplete="off" spellcheck="false">
+  <button id="go">Començar</button>
+</div>
+<div id="hud"></div>
+<div id="msg"></div>
+
+<script>
+// ------------------------------------------------------------------
+// CONFIGURACIÓ
+// ------------------------------------------------------------------
+const CFG = {
+  walkSpeed: 5,        // m/s
+  runSpeed: 11,        // m/s (Shift)
+  jumpSpeed: 6,        // m/s inicial del salt
+  gravity: 9.8,
+  scale: 1.5,          // mida del cavaller (1 = 1,8 m)
+  turnSpeed: 10,       // com de ràpid es gira cap on camina
+  mouseSens: 0.18,
+  walkStride: 2.6,     // metres per cicle complet de passes
+  runStride: 3.6,
+  frames: 8,
+};
+const CAL = Object.assign({ yaw: 0, tilt: 0, camOffset: 0 }, load('cavg_cal', {}));
+
+// ------------------------------------------------------------------
+// ESTAT
+// ------------------------------------------------------------------
+const S = {
+  lat: 0, lon: 0, agl: 0, vz: 0,
+  facing: 0,                        // cap on mira el cavaller (graus, des del nord)
+  camHeading: 0, camTilt: 70, range: 14,
+  ground: null, camGround: null,    // alçada del terra sobre el nivell del mar (Elevation API)
+  phase: 0, keys: {},
+};
+let map3d, ModelEl, elev, models = {}, current = null, lastT = performance.now();
+let lastElevPos = null, elevBusy = false, elevOk = null;
+
+// ------------------------------------------------------------------
+// INICI
+// ------------------------------------------------------------------
+['gkey','coords','base'].forEach(id => { const v = load('cavg_'+id, null); if (v) el(id).value = v; });
+
+el('go').onclick = async () => {
+  const key = val('gkey'), [la, lo] = val('coords').split(',').map(Number);
+  let base = val('base'); if (base && !base.endsWith('/')) base += '/';
+  if (!key) return msg('Falta la clau de Google', 4000);
+  if (!isFinite(la) || !isFinite(lo)) return msg('Coordenades incorrectes', 4000);
+  ['gkey','coords','base'].forEach(id => save('cavg_'+id, val(id)));
+  S.lat = la; S.lon = lo; S.agl = 20;  // apareix caient del cel
+  el('panel').style.display = 'none';
+  msg('Carregant…');
+  try {
+    await initGoogle(key);
+    createModels(base);
+    await updateGround(true);
+    initInput();
+    el('hud').style.display = 'block';
+    requestAnimationFrame(loop);
+    msg('Clic al mapa per controlar la càmera amb el ratolí', 4000);
+  } catch (e) { console.error(e); msg('Error: ' + e.message, 10000); }
+};
+
+async function initGoogle(key) {
+  (g=>{var h,a,k,p="The Google Maps JavaScript API",c="google",l="importLibrary",q="__ib__",m=document,b=window;b=b[c]||(b[c]={});var d=b.maps||(b.maps={}),r=new Set,e=new URLSearchParams,u=()=>h||(h=new Promise(async(f,n)=>{await (a=m.createElement("script"));e.set("libraries",[...r]+"");for(k in g)e.set(k.replace(/[A-Z]/g,t=>"_"+t[0].toLowerCase()),g[k]);e.set("callback",c+".maps."+q);a.src=`https://maps.${c}apis.com/maps/api/js?`+e;d[q]=f;a.onerror=()=>h=n(Error(p+" could not load."));a.nonce=m.querySelector("script[nonce]")?.nonce||"";m.head.append(a)}));d[l]?console.warn(p+" only loads once. Ignoring:",g):d[l]=(f,...n)=>r.add(f)&&u().then(()=>d[l](f,...n))})
+  ({ key, v: 'beta' });
+  let lib;
+  try { lib = await google.maps.importLibrary('maps3d'); }
+  catch (e) { throw new Error('Google Maps no carrega (bloquejador d\'anuncis?)'); }
+  ModelEl = lib.Model3DElement;
+  map3d = new lib.Map3DElement({
+    center: { lat: S.lat, lng: S.lon, altitude: 1000 },
+    range: S.range, tilt: S.camTilt, heading: S.camHeading, fov: 35,
+    mode: 'HYBRID',
+  });
+  try { map3d.defaultUIHidden = true; } catch(e) {}
+  el('gmap').append(map3d);
+  try {
+    const { ElevationService } = await google.maps.importLibrary('elevation');
+    elev = new ElevationService();
+  } catch (e) { elevOk = false; }
+}
+
+// ---------------- MODELS (un per fotograma) ----------------
+const HIDDEN = 0.0001;
+function createModels(base) {
+  const names = ['k_idle', 'k_jump'];
+  for (let i = 0; i < CFG.frames; i++) names.push('k_walk' + i, 'k_run' + i);
+  for (const n of names) {
+    const m = new ModelEl({
+      src: base + n + '.glb',
+      position: { lat: S.lat, lng: S.lon, altitude: S.agl },
+      altitudeMode: 'RELATIVE_TO_GROUND',          // sempre sobre el terra de Google
+      orientation: { heading: 0, tilt: CAL.tilt, roll: 0 },
+      scale: HIDDEN,
+    });
+    map3d.append(m);
+    models[n] = m;
+  }
+}
+
+function showFrame(name) {
+  const m = models[name];
+  m.position = { lat: S.lat, lng: S.lon, altitude: S.agl };
+  m.orientation = { heading: norm360(S.facing + CAL.yaw), tilt: CAL.tilt, roll: 0 };
+  if (current !== m) {
+    m.scale = CFG.scale;
+    if (current) current.scale = HIDDEN;
+    current = m;
+  }
+}
+
+// ---------------- TERRA (Elevation API) ----------------
+async function updateGround(force) {
+  if (!elev || elevBusy) return;
+  if (!force && lastElevPos && distM(lastElevPos, S) < 3) return;
+  elevBusy = true;
+  try {
+    const r = await elev.getElevationForLocations({ locations: [{ lat: S.lat, lng: S.lon }] });
+    S.ground = r.results[0].elevation;
+    if (S.camGround === null) S.camGround = S.ground;
+    lastElevPos = { lat: S.lat, lon: S.lon };
+    elevOk = true;
+  } catch (e) {
+    if (elevOk !== true) { elevOk = false; msg('Activa l\'Elevation API a Google Cloud perquè la càmera segueixi el terra', 8000); }
+  }
+  elevBusy = false;
+}
+
+// ------------------------------------------------------------------
+// BUCLE
+// ------------------------------------------------------------------
+let elevTimer = 0;
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  const K = S.keys;
+
+  // moviment relatiu a la càmera (estil Assassin's Creed)
+  const f = (K.KeyW?1:0) - (K.KeyS?1:0);
+  const r = (K.KeyD?1:0) - (K.KeyA?1:0);
+  const moving = f || r;
+  const run = K.ShiftLeft || K.ShiftRight;
+  let dist = 0;
+  if (moving) {
+    const bearing = S.camHeading + toDeg(Math.atan2(r, f));
+    dist = (run ? CFG.runSpeed : CFG.walkSpeed) * dt;
+    const br = toRad(bearing);
+    S.lat += toDeg(Math.cos(br) * dist / 6378137);
+    S.lon += toDeg(Math.sin(br) * dist / (6378137 * Math.cos(toRad(S.lat))));
+    S.facing = turnTowards(S.facing, bearing, CFG.turnSpeed * dt);
+  }
+  if (K.KeyQ) S.camHeading -= 90 * dt;
+  if (K.KeyE) S.camHeading += 90 * dt;
+
+  // salt i gravetat (alçada relativa al terra de Google)
+  S.vz -= CFG.gravity * dt;
+  S.agl += S.vz * dt;
+  const onGround = S.agl <= 0;
+  if (onGround) { S.agl = 0; S.vz = 0; }
+  if (K.Space && onGround) S.vz = CFG.jumpSpeed;
+
+  // fotograma de l'animació
+  S.phase += dist / (run ? CFG.runStride : CFG.walkStride) * CFG.frames;
+  let frame;
+  if (!onGround && S.agl > 0.1) frame = 'k_jump';
+  else if (moving) frame = (run ? 'k_run' : 'k_walk') + (Math.floor(S.phase) % CFG.frames);
+  else frame = 'k_idle';
+  showFrame(frame);
+
+  // terra per a la càmera
+  elevTimer += dt;
+  if (elevTimer > 0.3) { elevTimer = 0; updateGround(false); }
+  if (S.ground !== null) S.camGround += (S.ground - S.camGround) * Math.min(1, 4 * dt);
+
+  // càmera orbital
+  S.camTilt = clamp(S.camTilt, 20, 88);
+  S.range = clamp(S.range, 4, 80);
+  const look = 1.2 * CFG.scale;
+  map3d.center = { lat: S.lat, lng: S.lon, altitude: (S.camGround ?? 0) + S.agl + look + CAL.camOffset };
+  map3d.heading = norm360(S.camHeading);
+  map3d.tilt = S.camTilt;
+  map3d.range = S.range;
+
+  hud(onGround, frame);
+  requestAnimationFrame(loop);
+}
+
+// ------------------------------------------------------------------
+// CONTROLS
+// ------------------------------------------------------------------
+function initInput() {
+  const pad = el('input');
+  pad.addEventListener('click', () => { if (!document.pointerLockElement) pad.requestPointerLock(); });
+  addEventListener('mousemove', e => {
+    if (document.pointerLockElement !== pad) return;
+    S.camHeading += e.movementX * CFG.mouseSens;
+    S.camTilt    -= e.movementY * CFG.mouseSens;
+  });
+  pad.addEventListener('wheel', e => { e.preventDefault(); S.range *= e.deltaY > 0 ? 1.1 : 0.9; }, { passive:false });
+  addEventListener('keydown', e => {
+    S.keys[e.code] = true;
+    if (['Space','PageUp','PageDown'].includes(e.code)) e.preventDefault();
+    const step = e.shiftKey ? 5 : 0.5;
+    if (e.code === 'PageUp')   { CAL.camOffset += step; saveCal(); }
+    if (e.code === 'PageDown') { CAL.camOffset -= step; saveCal(); }
+    if (e.code === 'KeyR') { CAL.yaw = (CAL.yaw + 90) % 360; saveCal(); }
+    if (e.code === 'KeyT') { CAL.tilt = (CAL.tilt + 90) % 360; saveCal(); for (const n in models) models[n].orientation = { heading: 0, tilt: CAL.tilt, roll: 0 }; }
+    if (e.code === 'Equal' || e.code === 'NumpadAdd')      { CFG.scale *= 1.25; if (current) current.scale = CFG.scale; }
+    if (e.code === 'Minus' || e.code === 'NumpadSubtract') { CFG.scale /= 1.25; if (current) current.scale = CFG.scale; }
+  });
+  addEventListener('keyup', e => S.keys[e.code] = false);
+  addEventListener('blur', () => S.keys = {});
+}
+
+function hud(onGround, frame) {
+  el('hud').textContent =
+`Clic: ratolí = càmera · Esc: deixar anar
+WASD caminar · Shift córrer · Espai saltar
+Roda: zoom · Q / E girar càmera
+
++ / -      mida: ${CFG.scale.toFixed(2)}
+PgUp/PgDn  alçada càmera: ${CAL.camOffset.toFixed(1)} m
+R / T      girar model: ${CAL.yaw}° / ${CAL.tilt}°
+terra: ${S.ground === null ? (elevOk === false ? 'Elevation API NO disponible' : '…') : S.ground.toFixed(1) + ' m'}
+
+${S.lat.toFixed(6)}, ${S.lon.toFixed(6)}  ${onGround ? '' : '(a l\'aire)'}`;
+}
+
+// ------------------------------------------------------------------
+// UTILITATS
+// ------------------------------------------------------------------
+function el(id) { return document.getElementById(id); }
+function val(id) { return el(id).value.trim(); }
+function toRad(d) { return d * Math.PI / 180; }
+function toDeg(r) { return r * 180 / Math.PI; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function norm360(d) { return ((d % 360) + 360) % 360; }
+function turnTowards(a, b, k) { const d = ((b - a + 540) % 360) - 180; return a + d * Math.min(1, k); }
+function distM(a, b) {
+  const dy = (a.lat - b.lat) * 111320, dx = (a.lon - b.lon) * 111320 * Math.cos(toRad(a.lat));
+  return Math.hypot(dx, dy);
+}
+function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : (k === 'cavg_cal' ? JSON.parse(v) : v); } catch(e) { return d; } }
+function save(k, v) { try { localStorage.setItem(k, v); } catch(e) {} }
+function saveCal() { save('cavg_cal', JSON.stringify(CAL)); }
+let msgT;
+function msg(t, ms) {
+  const m = el('msg'); m.textContent = t; m.style.display = 'block';
+  clearTimeout(msgT); if (ms) msgT = setTimeout(() => m.style.display = 'none', ms);
+}
+</script>
