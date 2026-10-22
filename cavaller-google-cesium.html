@@ -75,7 +75,7 @@ const BONES = {
 };
 
 // Calibratge (es guarda al navegador)
-const CAL = Object.assign({ vfov: 35, vOffset: 0, yawOffset: 0 }, load('cav_cal2', {}));
+const CAL = Object.assign({ vfov: 35, vOffset: 0, yawOffset: 0 }, load('cav_cal3', {}));
 // L'Elevation API dona l'alçada sobre el nivell del mar, però la càmera de
 // Google 3D funciona sobre l'el·lipsoide: la diferència (geoide) a la península
 // és d'uns 50 m. Es calcula a l'inici comparant amb Cesium (si hi ha token).
@@ -175,12 +175,6 @@ async function initCesium(token, assetId, glbUrl) {
   // Alçada inicial del terra (Google Elevation API)
   await fetchGrid();
   S.ground = sampleGround(S.lat, S.lon) ?? 0;
-  if (token) try {
-    const wt = await Cesium.createWorldTerrainAsync();
-    const [c] = await Cesium.sampleTerrainMostDetailed(wt, [Cesium.Cartographic.fromDegrees(S.lon, S.lat)]);
-    const g = c.height - S.ground;
-    if (Math.abs(g) < 120) { GEOID = g; geoidSrc = 'auto'; }
-  } catch (e) { console.warn('No he pogut calcular el geoide', e); }
   S.agl = 25; // apareix caient del cel 😉
 
   // Cavaller
@@ -239,44 +233,79 @@ function fixSkinnedGlb(buf) {
 }
 
 // ------------------------------------------------------------------
-// TERRA: alçades de Google (Elevation API), en una graella al voltant del
-// cavaller. Una sola petició porta 81 punts; només se'n fa una de nova quan
-// el cavaller s'acosta a la vora. Si Google falla, es fa servir Open-Meteo.
+// TERRA: es demana una graella d'alçades al voltant del cavaller i se'n fa
+// una de nova quan s'acosta a la vora. Fonts, de més a menys precisa:
+//   1. IGN (MDT05, cel·les de 5 m, només Espanya)
+//   2. Google Elevation API
+//   3. Open-Meteo (cel·les de 90 m)
 // ------------------------------------------------------------------
-const GRID = { n: 9, step: 5, lat0: 0, lon0: 0, h: null, busy: false, src: '…' };
+const GRID = { g: null, busy: false, src: '…' };   // g = { lon0, lat0, dlon, dlat, nc, nr, v }  (fila 0 = sud)
 let elevSvc = null;
+
+async function gridIGN(lat, lon) {
+  const hw = 0.0007;   // ~ ±60 m
+  const u = 'https://servicios.idee.es/wcs-inspire/mdt?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage' +
+    `&COVERAGEID=Elevacion4258_5&SUBSET=Lat(${(lat - hw).toFixed(6)},${(lat + hw).toFixed(6)})` +
+    `&SUBSET=Long(${(lon - hw).toFixed(6)},${(lon + hw).toFixed(6)})&FORMAT=application/asc`;
+  const txt = await (await fetch(u)).text();
+  const a = txt.indexOf('ncols');
+  if (a < 0) throw new Error('IGN sense dades');
+  const body = txt.slice(a).split('--wcs')[0].trim().split(/\s+/);
+  const H = {}; let k = 0;
+  while (k < body.length && /^[a-z_]+$/i.test(body[k])) { H[body[k].toLowerCase()] = Number(body[k + 1]); k += 2; }
+  const nc = H.ncols, nr = H.nrows, dlon = H.dx || H.cellsize, dlat = H.dy || H.cellsize;
+  const raw = body.slice(k, k + nc * nr).map(Number);
+  if (raw.length < nc * nr || raw.some(x => !isFinite(x) || x === H.nodata_value || x < -500)) throw new Error('IGN incomplet');
+  const v = new Float64Array(nc * nr);                  // ArcGrid ve de nord a sud: el girem
+  for (let r = 0; r < nr; r++) for (let c = 0; c < nc; c++) v[r * nc + c] = raw[(nr - 1 - r) * nc + c];
+  // els valors són al centre de cada cel·la
+  return { lon0: H.xllcorner + dlon / 2, lat0: H.yllcorner + dlat / 2, dlon, dlat, nc, nr, v };
+}
+
+async function gridPoints(lat, lon, getHeights) {
+  const n = 9, step = 5, half = (n - 1) / 2;
+  const dlat = step / 111320, dlon = step / (111320 * Math.cos(R(lat)));
+  const locs = [];
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) locs.push({ lat: lat + (y - half) * dlat, lng: lon + (x - half) * dlon });
+  const h = await getHeights(locs);
+  return { lon0: lon - half * dlon, lat0: lat - half * dlat, dlon, dlat, nc: n, nr: n, v: Float64Array.from(h) };
+}
+async function heightsGoogle(locs) {
+  if (!elevSvc) { const { ElevationService } = await google.maps.importLibrary('elevation'); elevSvc = new ElevationService(); }
+  const r = await elevSvc.getElevationForLocations({ locations: locs });
+  return r.results.map(x => x.elevation);
+}
+async function heightsOpenMeteo(locs) {
+  const lats = locs.map(l => l.lat.toFixed(6)).join(','), lons = locs.map(l => l.lng.toFixed(6)).join(',');
+  const r = await (await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`)).json();
+  return r.elevation;
+}
+
 async function fetchGrid() {
   if (GRID.busy) return;
   GRID.busy = true;
-  const n = GRID.n, half = (n - 1) / 2, lat0 = S.lat, lon0 = S.lon;
-  const mLat = 1 / 111320, mLon = 1 / (111320 * Math.cos(R(lat0)));
-  const locs = [];
-  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++)
-    locs.push({ lat: lat0 + (y - half) * GRID.step * mLat, lng: lon0 + (x - half) * GRID.step * mLon });
-  let h = null;
-  try {
-    if (!elevSvc) { const { ElevationService } = await google.maps.importLibrary('elevation'); elevSvc = new ElevationService(); }
-    const r = await elevSvc.getElevationForLocations({ locations: locs });
-    h = r.results.map(x => x.elevation); GRID.src = 'Google';
-  } catch (e) {
-    try {
-      const lats = locs.map(l => l.lat.toFixed(6)).join(','), lons = locs.map(l => l.lng.toFixed(6)).join(',');
-      const r = await (await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`)).json();
-      h = r.elevation; GRID.src = 'Open-Meteo (Google ha fallat)';
-    } catch (e2) { GRID.src = 'cap'; }
+  const lat = S.lat, lon = S.lon;
+  const sources = [
+    ['IGN 5 m',     () => gridIGN(lat, lon)],
+    ['Google',      () => gridPoints(lat, lon, heightsGoogle)],
+    ['Open-Meteo',  () => gridPoints(lat, lon, heightsOpenMeteo)],
+  ];
+  for (const [name, fn] of sources) {
+    try { GRID.g = await fn(); GRID.src = name; break; }
+    catch (e) { console.warn('Alçades', name, 'ha fallat:', e.message); }
   }
-  if (h) { GRID.h = h; GRID.lat0 = lat0; GRID.lon0 = lon0; }
   GRID.busy = false;
 }
+
 function sampleGround(lat, lon) {
-  if (!GRID.h) return null;
-  const n = GRID.n, half = (n - 1) / 2;
-  const gx = (lon - GRID.lon0) * 111320 * Math.cos(R(GRID.lat0)) / GRID.step + half;
-  const gy = (lat - GRID.lat0) * 111320 / GRID.step + half;
-  if (gx < 2 || gy < 2 || gx > n - 3 || gy > n - 3) fetchGrid();   // a prop de la vora: en demana una de nova
-  const x = Cesium.Math.clamp(gx, 0, n - 1.001), y = Cesium.Math.clamp(gy, 0, n - 1.001);
-  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0, H = GRID.h;
-  const a = H[y0 * n + x0], b = H[y0 * n + x0 + 1], c = H[(y0 + 1) * n + x0], d = H[(y0 + 1) * n + x0 + 1];
+  const g = GRID.g;
+  if (!g) return null;
+  const gx = (lon - g.lon0) / g.dlon, gy = (lat - g.lat0) / g.dlat;
+  const m = Math.min(4, (g.nc - 1) / 4);                              // marge abans de demanar-ne una de nova
+  if (gx < m || gy < m || gx > g.nc - 1 - m || gy > g.nr - 1 - m) fetchGrid();
+  const x = Cesium.Math.clamp(gx, 0, g.nc - 1.001), y = Cesium.Math.clamp(gy, 0, g.nr - 1.001);
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0, V = g.v, n = g.nc;
+  const a = V[y0 * n + x0], b = V[y0 * n + x0 + 1], c = V[(y0 + 1) * n + x0], d = V[(y0 + 1) * n + x0 + 1];
   return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
 }
 
@@ -380,7 +409,7 @@ function syncCameras() {
 
   // Google: l'alçada del centre és sobre el NIVELL DEL MAR
   if (map3d) {
-    const alt = S.ground + GEOID + S.agl + CFG.lookHeight + CAL.vOffset;
+    const alt = S.ground + S.agl + CFG.lookHeight + CAL.vOffset;   // Google: sobre el nivell del mar, com l'Elevation API
     map3d.center = { lat: S.lat, lng: S.lon, altitude: alt };
     map3d.heading = ((S.heading % 360) + 360) % 360;
     map3d.tilt = S.tilt;
@@ -442,7 +471,7 @@ function initInput() {
 function updateHud(onGround) {
   document.getElementById('hud').textContent =
 `WASD caminar · Shift córrer · Espai saltar
-Clic: el ratolí dirigeix el cavaller · Esc: deixar-lo anar · Roda zoom
+Clic: el ratolí mou la càmera · Esc: deixar-lo anar · Roda zoom
 Q / E girar càmera
 
 CALIBRATGE
@@ -451,7 +480,7 @@ PgUp/PgDn alçada: ${CAL.vOffset.toFixed(1)} m (Shift: ×10)
 R     girar model: ${CAL.yawOffset}°
 G     veure terra Cesium: ${S.showGround ? 'sí' : 'no'}
 P     punt groc als peus
-terra: ${S.ground.toFixed(1)} m (${GRID.src}) · geoide ${GEOID.toFixed(1)} m (${geoidSrc})
+terra: ${S.ground.toFixed(1)} m (${GRID.src})
 
 CAVALLER: ${modelStatus}
 escala: ${knight ? knight.scale : '-'}  (+ / -)
@@ -467,9 +496,9 @@ function turnTowards(a, b, k) {
   return a + d * Math.min(1, k);
 }
 function val(id) { return document.getElementById(id).value.trim(); }
-function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : (k === 'cav_cal2' ? JSON.parse(v) : v); } catch(e) { return d; } }
+function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : (k === 'cav_cal3' ? JSON.parse(v) : v); } catch(e) { return d; } }
 function save(k, v) { try { localStorage.setItem(k, v); } catch(e) {} }
-function saveCal() { save('cav_cal2', JSON.stringify(CAL)); }
+function saveCal() { save('cav_cal3', JSON.stringify(CAL)); }
 let msgT;
 function msg(t, ms) {
   const m = document.getElementById('msg'); m.textContent = t; m.style.display = 'block';
