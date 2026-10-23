@@ -24,6 +24,18 @@
   }
   #msg { position:absolute; z-index:11; bottom:40px; left:50%; transform:translateX(-50%);
     background:rgba(0,0,0,.75); color:#fff; padding:8px 14px; border-radius:8px; font-size:13px; display:none; }
+  /* ---- controls tàctils (iPad) ---- */
+  #cesium, #touch { touch-action:none; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  html, body { overscroll-behavior:none; }
+  #touch { position:absolute; inset:0; z-index:6; pointer-events:none; display:none; }
+  #joy { position:absolute; left:28px; bottom:28px; width:160px; height:160px; border-radius:50%;
+    background:rgba(255,255,255,.10); border:2px solid rgba(255,255,255,.35); pointer-events:auto; }
+  #knob { position:absolute; left:50%; top:50%; width:66px; height:66px; margin:-33px; border-radius:50%;
+    background:rgba(255,255,255,.45); box-shadow:0 2px 8px rgba(0,0,0,.4); }
+  #btns { position:absolute; right:24px; bottom:24px; display:grid; grid-template-columns:repeat(2, 76px); gap:14px; pointer-events:auto; }
+  #btns button { width:76px; height:76px; border-radius:50%; border:2px solid rgba(255,255,255,.45);
+    background:rgba(0,0,0,.40); color:#fff; font:600 13px system-ui; line-height:1.2; padding:0; }
+  #btns button.on { background:rgba(201,162,39,.75); color:#000; }
 </style>
 
 <div id="gmap"></div>
@@ -45,6 +57,15 @@
 </div>
 <div id="hud"></div>
 <div id="msg"></div>
+<div id="touch">
+  <div id="joy"><div id="knob"></div></div>
+  <div id="btns">
+    <button data-b="info">ℹ️<br>Info</button>
+    <button data-b="fall">⬇️<br>Caure</button>
+    <button data-b="run">🏃<br>Córrer</button>
+    <button data-b="jump">⤴️<br>Saltar</button>
+  </div>
+</div>
 
 <script>
 // ------------------------------------------------------------------
@@ -118,7 +139,8 @@ document.getElementById('go').onclick = async () => {
     await initGoogle(gkey);
     await initCesium(ctoken, Number(asset), val('glburl'));
     initInput();
-    msg('Llest! WASD per caminar', 2500);
+    initTouch();
+    msg('Llest! WASD per caminar · I per veure la informació', 3500);
   } catch (e) {
     console.error(e); msg('Error: ' + e.message, 10000);
   }
@@ -401,11 +423,13 @@ function tick() {
   const K = S.keys;
 
   // --- moviment ---
-  let f = (K.KeyW?1:0) - (K.KeyS?1:0);
-  let r = (K.KeyD?1:0) - (K.KeyA?1:0);
-  const moving = (f || r) && !FALL.on;
-  const run = K.ShiftLeft || K.ShiftRight;
-  const speed = run ? CFG.runSpeed : CFG.walkSpeed;
+  // teclat + joystick tàctil (analògic)
+  let f = (K.KeyW?1:0) - (K.KeyS?1:0) + JOY.y;
+  let r = (K.KeyD?1:0) - (K.KeyA?1:0) + JOY.x;
+  const mag = Math.min(1, Math.hypot(f, r));
+  const moving = mag > 0.15 && !FALL.on;
+  const run = K.ShiftLeft || K.ShiftRight || JOY.run;
+  const speed = (run ? CFG.runSpeed : CFG.walkSpeed) * (JOY.active ? Math.max(0.35, mag) : 1);
   let dist = 0;
   if (moving) {
     const bearing = R(S.heading) + Math.atan2(r, f);
@@ -559,7 +583,7 @@ function syncCameras() {
 // CONTROLS
 // ------------------------------------------------------------------
 function initInput() {
-  document.getElementById('hud').style.display = 'block';
+  document.getElementById('hud').style.display = 'none';   // amagat mentre jugues (tecla I)
   addEventListener('keydown', e => {
     S.keys[e.code] = true;
     if (['Space','PageUp','PageDown'].includes(e.code)) e.preventDefault();
@@ -577,6 +601,7 @@ function initInput() {
       viewer.scene.globe.baseColor = S.showGround ? new Cesium.Color(1, 0.2, 0.2, 0.35) : Cesium.Color.TRANSPARENT;
     }
     if (e.key === 'ñ' || e.key === 'Ñ' || e.code === 'Semicolon') { FALL.on ? resetFall() : startFall(); }
+    if (e.code === 'KeyI') { const h = document.getElementById('hud'); h.style.display = h.style.display === 'none' ? 'block' : 'none'; }
     if (e.code === 'KeyM') {
       if (document.pointerLockElement) document.exitPointerLock();
       else viewer.canvas.requestPointerLock();
@@ -586,7 +611,7 @@ function initInput() {
   addEventListener('blur', () => S.keys = {});
 
   const cv = viewer.canvas; let drag = false;
-  cv.addEventListener('pointerdown', () => { drag = true; if (!document.pointerLockElement) cv.requestPointerLock(); });
+  cv.addEventListener('pointerdown', e => { if (e.pointerType !== 'mouse') return; drag = true; if (!document.pointerLockElement) cv.requestPointerLock(); });
   addEventListener('pointerup', () => drag = false);
   addEventListener('mousemove', e => {
     if (!drag && document.pointerLockElement !== cv) return;
@@ -594,6 +619,71 @@ function initInput() {
     S.tilt    -= e.movementY * CFG.mouseSens;
   });
   cv.addEventListener('wheel', e => { e.preventDefault(); S.range *= e.deltaY > 0 ? 1.1 : 0.9; }, { passive:false });
+}
+
+// ------------------------------------------------------------------
+// CONTROLS TÀCTILS (iPad): joystick a l'esquerra, botons a la dreta,
+// arrossegar un dit per girar la càmera, pessigar per fer zoom.
+// ------------------------------------------------------------------
+const JOY = { x: 0, y: 0, active: false, run: false };
+function isTouchDevice() {
+  return (navigator.maxTouchPoints || 0) > 0 && matchMedia('(pointer: coarse)').matches;
+}
+function initTouch() {
+  if (!isTouchDevice()) return;
+  const ui = document.getElementById('touch'); ui.style.display = 'block';
+  viewer.scene.globe.maximumScreenSpaceError = 4;          // una mica més lleuger per a l'iPad
+
+  // joystick
+  const joy = document.getElementById('joy'), knob = document.getElementById('knob');
+  let joyId = null;
+  const setJoy = e => {
+    const r = joy.getBoundingClientRect(), R0 = r.width / 2 - 20;
+    let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+    const d = Math.hypot(dx, dy); if (d > R0) { dx *= R0 / d; dy *= R0 / d; }
+    knob.style.transform = `translate(${dx}px, ${dy}px)`;
+    JOY.x = dx / R0; JOY.y = -dy / R0; JOY.active = true;
+  };
+  joy.addEventListener('pointerdown', e => { joyId = e.pointerId; joy.setPointerCapture(e.pointerId); setJoy(e); e.preventDefault(); });
+  joy.addEventListener('pointermove', e => { if (e.pointerId === joyId) setJoy(e); });
+  const endJoy = e => { if (e.pointerId !== joyId) return; joyId = null; JOY.x = JOY.y = 0; JOY.active = false; knob.style.transform = ''; };
+  joy.addEventListener('pointerup', endJoy); joy.addEventListener('pointercancel', endJoy);
+
+  // botons
+  document.querySelectorAll('#btns button').forEach(b => {
+    const k = b.dataset.b;
+    b.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      if (k === 'jump') S.keys.Space = true;
+      if (k === 'run')  { JOY.run = !JOY.run; b.classList.toggle('on', JOY.run); }
+      if (k === 'fall') { FALL.on ? resetFall() : startFall(); }
+      if (k === 'info') { const h = document.getElementById('hud'); h.style.display = h.style.display === 'none' ? 'block' : 'none'; }
+    });
+    const up = () => { if (k === 'jump') S.keys.Space = false; };
+    b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up); b.addEventListener('pointerleave', up);
+  });
+
+  // càmera: un dit gira, dos dits fan zoom
+  const cv = viewer.canvas, pts = new Map(); let pinch = 0;
+  const dist2 = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+  cv.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse') return;
+    cv.setPointerCapture(e.pointerId); pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 2) pinch = dist2();
+  });
+  cv.addEventListener('pointermove', e => {
+    const p = pts.get(e.pointerId); if (!p) return;
+    if (pts.size === 1) {
+      S.heading += (e.clientX - p.x) * 0.35;
+      S.tilt    -= (e.clientY - p.y) * 0.30;
+    }
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.size === 2) { const d = dist2(); if (pinch > 0) S.range *= pinch / d; pinch = d; }
+  });
+  const endPt = e => { pts.delete(e.pointerId); pinch = pts.size === 2 ? dist2() : 0; };
+  cv.addEventListener('pointerup', endPt); cv.addEventListener('pointercancel', endPt);
+  document.addEventListener('gesturestart', e => e.preventDefault());   // evita el zoom de Safari
+  msg('Joystick per caminar · arrossega per girar la càmera · pessiga per fer zoom', 5000);
 }
 
 function updateHud(onGround) {
