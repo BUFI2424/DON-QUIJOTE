@@ -1,3 +1,14 @@
+<script>
+// ============================================================
+//  CLAUS DEL JOC: enganxa-les entre les cometes '' de les dues línies d'aquí sota.
+//  Si les deixes buides, el joc les demana a l'inici.
+// ============================================================
+const KEYS = {
+  google: '',
+  cesium: '',
+  directe: true,   // true: amb les claus posades, el joc comença sol (sense panell). false: mostra el panell per triar personatge i vista
+};
+</script>
 <!-- ============================================================
   CAVALLER SOBRE GOOGLE 3D MAPS  (visual: Google · física i cavaller: Cesium)
   Enganxa TOT això al panell HTML de CodePen (deixa CSS i JS buits).
@@ -43,16 +54,30 @@
 
 <div id="panel">
   <b>🛡️ Cavaller a Google 3D</b>
+  <div id="keysBox">
   <label>Google Maps API key</label>
   <input id="gkey" type="text" autocomplete="off" spellcheck="false">
   <label>Cesium ion token</label>
   <input id="ctoken" type="text" autocomplete="off" spellcheck="false">
+  </div>
   <label>Coordenades d'inici (lat, lon)</label>
   <input id="coords" value="39.97508693293566, -4.924448146465163">
-  <label>ID de l'asset del cavaller (Cesium ion)</label>
-  <input id="asset" value="6069389">
-  <label>…o URL directa d'un .glb (si l'omples, té prioritat)</label>
-  <input id="glburl" value="https://raw.githubusercontent.com/BUFI2424/DON-QUIJOTE/main/knight__ps1_psx.glb" autocomplete="off" spellcheck="false">
+  <label>Personatge</label>
+  <select id="avatar" style="width:100%;padding:6px;border-radius:6px;border:1px solid #445;background:#111;color:#fff">
+    <option value="miner">⛑️ Miner</option>
+    <option value="cavaller">🛡️ Cavaller</option>
+  </select>
+  <label>Vista</label>
+  <select id="view" style="width:100%;padding:6px;border-radius:6px;border:1px solid #445;background:#111;color:#fff">
+    <option value="third">🎥 3a persona</option>
+    <option value="body">👁️ Primera persona: es veuen braços i cames</option>
+    <option value="none">👁️ Primera persona sense cos</option>
+  </select>
+  <label>Controls</label>
+  <select id="controls" style="width:100%;padding:6px;border-radius:6px;border:1px solid #445;background:#111;color:#fff">
+    <option value="pc">💻 PC: teclat i ratolí</option>
+    <option value="ipad">📱 iPad: joystick i botons a la pantalla</option>
+  </select>
   <button id="go">Començar</button>
 </div>
 <div id="hud"></div>
@@ -64,6 +89,8 @@
     <button data-b="fall">⬇️<br>Caure</button>
     <button data-b="run">🏃<br>Córrer</button>
     <button data-b="jump">⤴️<br>Saltar</button>
+    <button data-b="smoke">🚬<br>Fumar</button>
+    <button data-b="view">👁️<br>Vista</button>
   </div>
 </div>
 
@@ -82,6 +109,7 @@ const CFG = {
   mouseSens: 0.18,
   walkStride: 2.6,     // metres per cicle de passes
   runStride: 3.8,
+  povFov: 70,          // camp de visió vertical a la primera persona (més ample, com als jocs)
 };
 
 // Eixos dels ossos (calculats a partir del teu .glb): eix lateral i frontal
@@ -114,33 +142,64 @@ const S = {
   heading: 0, tilt: 70, range: 14,  // càmera orbital
   phase: 0, walkAmt: 0,
   keys: {}, showGround: false,
+  view: 'third',      // 'third' = 3a persona · 'body' = primera persona veient braços i cames · 'none' = primera persona sense cos
+  eye: 2.4, eyeFwd: 0.16,   // alçada dels ulls i distància cap endavant des del centre del cap (m)
 };
+const VIEWS = ['third', 'body', 'none'];
+function cycleView() {
+  S.view = VIEWS[(VIEWS.indexOf(S.view) + 1) % VIEWS.length];
+  if (S.view !== 'third') S.tilt = 88; else S.tilt = 70;
+  msg({ third: '3a persona', body: 'Primera persona: braços i cames', none: 'Primera persona sense cos' }[S.view], 1800);
+}
 let viewer, map3d, knight, bones = {}, lastT = performance.now();
 const R = Cesium.Math.toRadians;
 
 // ------------------------------------------------------------------
 // INICI
 // ------------------------------------------------------------------
-['gkey','ctoken','coords','asset','glburl'].forEach(id => {
+// Personatges disponibles (fitxers al repositori de GitHub)
+const AVATARS = {
+  cavaller: { url: 'https://raw.githubusercontent.com/BUFI2424/DON-QUIJOTE/main/knight__ps1_psx.glb', scale: 1.5, eye: 2.41 },
+  miner:    { url: 'https://raw.githubusercontent.com/BUFI2424/DON-QUIJOTE/main/miner.glb',          scale: 1.4, eye: 2.44 },
+};
+document.getElementById('controls').value = isTouchDevice() ? 'ipad' : 'pc';   // proposta inicial segons l'aparell
+['gkey','ctoken','coords','avatar','view','controls'].forEach(id => {
   const v = load('cav_'+id, null); if (v) document.getElementById(id).value = v;
 });
+// Claus posades al codi: no cal demanar-les
+if (KEYS.google) {
+  document.getElementById('gkey').value = KEYS.google;
+  document.getElementById('ctoken').value = KEYS.cesium;
+  document.getElementById('keysBox').style.display = 'none';
+}
+// Opcions a l'enllaç: ?jugar comença directament, i també es pot triar
+// ?personatge=miner|cavaller  ?vista=third|body|none  ?controls=pc|ipad  ?lloc=lat,lon
+{
+  const q = new URLSearchParams(location.search);
+  const set = (id, v) => { if (v) document.getElementById(id).value = v; };
+  set('avatar', q.get('personatge')); set('view', q.get('vista'));
+  set('controls', q.get('controls')); set('coords', q.get('lloc'));
+  if ((q.has('jugar') || (KEYS.google && KEYS.directe)) && val('gkey')) setTimeout(() => document.getElementById('go').click(), 0);
+}
 
 document.getElementById('go').onclick = async () => {
-  const gkey = val('gkey'), ctoken = val('ctoken'), coords = val('coords'), asset = val('asset');
+  const gkey = val('gkey'), ctoken = val('ctoken'), coords = val('coords');
+  const av = AVATARS[val('avatar')] || AVATARS.miner;
   if (!gkey) return msg('Falta la clau de Google', 4000);
-  if (!ctoken && !val('glburl')) return msg('Cal el token de Cesium o una URL de .glb', 4000);
-  ['gkey','ctoken','coords','asset','glburl'].forEach(id => save('cav_'+id, val(id)));
-  const [la, lo] = coords.split(',').map(Number);
+  ['coords','avatar','view','controls'].concat(KEYS.google ? [] : ['gkey','ctoken']).forEach(id => save('cav_'+id, val(id)));
+  S.view = val('view') || 'third'; S.eye = av.eye; S.eyeFwd = 0.30 * av.scale / 1.4;
+  if (S.view !== 'third') S.tilt = 88;
+  const [la, lo] = parseCoords(coords);
   if (!isFinite(la) || !isFinite(lo)) return msg('Coordenades incorrectes', 4000);
   S.lat = la; S.lon = lo;
   document.getElementById('panel').style.display = 'none';
   msg('Carregant…');
   try {
     await initGoogle(gkey);
-    await initCesium(ctoken, Number(asset), val('glburl'));
+    await initCesium(ctoken, av);
     initInput();
-    initTouch();
-    msg('Llest! WASD per caminar · I per veure la informació', 3500);
+    if (val('controls') === 'ipad') initTouch();
+    else msg('Llest! WASD caminar · clic esquerre fumar · I informació', 4000);
   } catch (e) {
     console.error(e); msg('Error: ' + e.message, 10000);
   }
@@ -168,7 +227,7 @@ async function initGoogle(key) {
 }
 
 // ---------------- CESIUM (transparent: física + cavaller) ----------------
-async function initCesium(token, assetId, glbUrl) {
+async function initCesium(token, av) {
   if (token) Cesium.Ion.defaultAccessToken = token;
 
   viewer = new Cesium.Viewer('cesium', {
@@ -213,9 +272,8 @@ async function initCesium(token, assetId, glbUrl) {
   preloadAbyss(token);   // deixa preparat el terreny de Cesium per a la caiguda (tecla Ñ)
 
   try {
-    const res = glbUrl ? new Cesium.Resource({ url: glbUrl }) : await Cesium.IonResource.fromAssetId(assetId);
-    const buf = await res.fetchArrayBuffer();
-    knight = await Cesium.Model.fromGltfAsync({ gltf: fixSkinnedGlb(buf), scale: CFG.modelScale });
+    const buf = await new Cesium.Resource({ url: av.url + '?v=' + Date.now() }).fetchArrayBuffer();   // sempre la versió nova del GitHub
+    knight = await Cesium.Model.fromGltfAsync({ gltf: fixSkinnedGlb(buf), scale: av.scale });
     sc.primitives.add(knight);
     knight.errorEvent.addEventListener(e => { modelStatus = 'ERROR: ' + (e.message || e); console.error(e); });
     knight.readyEvent.addEventListener(() => {
@@ -236,6 +294,8 @@ function fixSkinnedGlb(buf) {
   if (dv.getUint32(0, true) !== 0x46546c67) throw new Error('El fitxer no és un .glb');
   const jl = dv.getUint32(12, true);
   const j = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, jl)));
+  MODEL_AXES = (j.asset && j.asset.extras && j.asset.extras.boneAxes) || null;
+  MODEL_SMOKE = (j.asset && j.asset.extras && j.asset.extras.smoke) || null;   // fotogrames clau de fumar, fets per a aquest model   // eixos dels ossos propis del model
   const rest = new Uint8Array(buf, 20 + jl);            // la resta de chunks (BIN), intactes
   const sc = j.scenes[j.scene || 0];
   j.nodes.forEach((n, i) => {
@@ -402,6 +462,7 @@ function resetFall() {
   updateOff();
 }
 
+let MODEL_AXES = null, MODEL_SMOKE = null, HEAD = null;
 function findBones() {
   const all = Object.keys(knight._nodesByName || {});
   for (const b in BONES) {
@@ -409,8 +470,20 @@ function findBones() {
     const node = name && knight.getNode(name);
     if (!node) { console.warn('Os no trobat:', b); continue; }
     const norm = v => Cesium.Cartesian3.normalize(new Cesium.Cartesian3(...v), new Cesium.Cartesian3());
-    bones[b] = { node, lat: norm(BONES[b].lat), fwd: BONES[b].fwd ? norm(BONES[b].fwd) : null };
+    const ax = (MODEL_AXES && MODEL_AXES[b]) || BONES[b];
+    bones[b] = { node, lat: norm(ax.lat), fwd: ax.fwd ? norm(ax.fwd) : null, up: MODEL_AXES ? norm([0, 1, 0]) : null };
   }
+  // el miner també mou el cúbit i la mà per portar-se el cigarret a la boca
+  if (MODEL_AXES) {
+    const nm = n => n.replace(/^.*:/, '').replace(/_\d+$/, '');
+    for (const b of ['LeftForeArm', 'LeftHand']) {
+      const name = all.find(n => nm(n) === b), node = name && knight.getNode(name);
+      if (node) bones[b] = { node, lat: new Cesium.Cartesian3(1, 0, 0), fwd: new Cesium.Cartesian3(0, 0, 1), up: new Cesium.Cartesian3(0, 1, 0) };
+    }
+  }
+  // el cap s'amaga (s'encongeix) a la primera persona perquè no tapi la càmera
+  { const nm = n => n.replace(/^.*:/, '').replace(/_\d+$/, '');
+    const name = all.find(n => nm(n) === 'Head'); HEAD = name ? { node: knight.getNode(name), hidden: false } : null; }
   if (!Object.keys(bones).length) msg('No he trobat l\'esquelet: el cavaller lliscarà sense moure les cames', 6000);
 }
 
@@ -442,6 +515,7 @@ function tick() {
   }
   if (K.KeyQ) S.heading -= 90 * dt;
   if (K.KeyE) S.heading += 90 * dt;
+  if (S.view !== 'third') S.facing = R(S.heading);           // primera persona: el cos mira on mira la càmera
 
   // --- terra i gravetat ---
   let onGround;
@@ -467,6 +541,7 @@ function tick() {
   const target = moving && onGround ? 1 : 0;
   S.walkAmt += (target - S.walkAmt) * Math.min(1, 8 * dt);
   S.phase += dist / (run ? CFG.runStride : CFG.walkStride) * Math.PI * 2;
+  updateSmoke(dt);
   animateBones(run, onGround);
 
   // --- posició del cavaller ---
@@ -475,7 +550,11 @@ function tick() {
   const wob = FALL.on ? Math.min(1, FALL.t * 2) : 0;      // tentines mentre cau
   const hpr = new Cesium.HeadingPitchRoll(S.facing - Math.PI / 2 + R(CAL.yawOffset) + wob * R(15) * Math.sin(FALL.t * 1.7),
     wob * R(10) * Math.sin(FALL.t * 2.3), wob * R(14) * Math.sin(FALL.t * 3.1));
-  if (knight) knight.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(pos, hpr);
+  if (knight) {
+    knight.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(pos, hpr);
+    knight.show = S.view !== 'none';
+    setHeadHidden(S.view === 'body');
+  }
   if (marker) marker.position = pos;
 
   // --- càmeres sincronitzades ---
@@ -483,16 +562,63 @@ function tick() {
   updateHud(onGround);
 }
 
+// ------------------------------------------------------------------
+// FUMAR (clic esquerre): el miner s'acosta el Ducados a la boca, xupa i el baixa
+// ------------------------------------------------------------------
+const SMOKE = { on: false, t: 0, w: 0, up: 0.9, hold: 2.4, down: 0.9 };
+const Q_ID = Cesium.Quaternion.IDENTITY;
+// quaternió de fumar d'un os per a un progrés s (0 = braç baixat, 1 = cigarret a la boca),
+// passant per una postura intermèdia (colze doblegat davant del cos)
+function smokeQuat(b, s) {
+  const k = MODEL_SMOKE && MODEL_SMOKE.bones[b]; if (!k) return null;
+  const q1 = new Cesium.Quaternion(...k[0]), q2 = new Cesium.Quaternion(...k[1]);
+  return s < 0.5 ? Cesium.Quaternion.slerp(Q_ID, q1, s * 2, new Cesium.Quaternion())
+                 : Cesium.Quaternion.slerp(q1, q2, s * 2 - 1, new Cesium.Quaternion());
+}
+function startSmoke() {
+  if (SMOKE.on || FALL.on || !bones.LeftForeArm) return;
+  if (!MODEL_SMOKE) { msg('Aquest miner.glb és antic: puja el nou al GitHub perquè pugui fumar', 6000); return; }
+  SMOKE.on = true; SMOKE.t = 0;
+}
+function updateSmoke(dt) {
+  if (FALL.on) SMOKE.on = false;
+  if (SMOKE.on) {
+    SMOKE.t += dt;
+    if (SMOKE.t > SMOKE.up + SMOKE.hold + SMOKE.down) SMOKE.on = false;
+  }
+  const t = SMOKE.t, ease = x => x * x * (3 - 2 * x);
+  let target = 0;
+  if (SMOKE.on) target = t < SMOKE.up ? ease(t / SMOKE.up) : t < SMOKE.up + SMOKE.hold ? 1 : ease(1 - (t - SMOKE.up - SMOKE.hold) / SMOKE.down);
+  SMOKE.w = SMOKE.on ? target : Math.max(0, SMOKE.w - dt * 4);
+}
+
+function setHeadHidden(h) {
+  if (!HEAD || !HEAD.node || HEAD.hidden === h) return;
+  HEAD.node.matrix = h ? Cesium.Matrix4.multiply(HEAD.node.originalMatrix, Cesium.Matrix4.fromUniformScale(0.001), new Cesium.Matrix4())
+                       : Cesium.Matrix4.clone(HEAD.node.originalMatrix);
+  if (!h) HEAD.node.matrix = undefined;
+  HEAD.hidden = h;
+}
+
+// Torna l'os a la postura original. Primer l'assignem explícitament perquè Cesium
+// recalculi la pell (si no, els models sense animació pròpia es queden congelats).
+function releaseBone(B) {
+  B.node.matrix = Cesium.Matrix4.clone(B.node.originalMatrix);
+  B.node.matrix = undefined;
+  B.active = false;
+}
+
 function animateBones(run, onGround) {
   if (!knight || !knight.ready) return;
+  const LS = MODEL_AXES ? -1 : 1;   // als ossos del miner, obrir la cama cap enfora té el signe contrari que al cavaller
   let pose;
   if (FALL.on) {
     // caient al buit: braços enlaire agitant-se i cames pedalant
     const ft = FALL.t, k = Math.min(1, ft * 3);           // entra en 1/3 de segon
     const s = Math.sin(ft * 10), s2 = Math.sin(ft * 10 + Math.PI), sa = Math.sin(ft * 13), sb = Math.sin(ft * 8 + 1.3);
     pose = {
-      LeftUpLeg:  { sw: k * R(40) * s,  ad: -k * R(18) },
-      RightUpLeg: { sw: k * R(40) * s2, ad:  k * R(18) },
+      LeftUpLeg:  { sw: k * R(40) * s,  ad: -LS * k * R(18) },
+      RightUpLeg: { sw: k * R(40) * s2, ad:  LS * k * R(18) },
       LeftLeg:    { sw: k * (R(25) + R(35) * (0.5 + 0.5 * Math.sin(ft * 10 + 1.2))) },
       RightLeg:   { sw: k * (R(25) + R(35) * (0.5 + 0.5 * Math.sin(ft * 10 + 1.2 + Math.PI))) },
       LeftArm:    { sw: k * R(45) * sb, ad: k * (R(80) + R(30) * sa) },
@@ -501,32 +627,50 @@ function animateBones(run, onGround) {
   } else {
     const a = S.walkAmt, p = S.phase;
     const air = onGround ? 0 : 1;
-    if (a < 0.01 && !air) {           // quiet: torna el control a l'animació Idle
-      for (const b in bones) if (bones[b].active) { bones[b].node.matrix = undefined; bones[b].active = false; }
+    if (a < 0.01 && !air && SMOKE.w <= 0.001) {           // quiet: torna el control a l'animació Idle
+      for (const b in bones) if (bones[b].active) releaseBone(bones[b]);
       return;
     }
-    const A = R(run ? 45 : 28) * a, Kn = R(run ? 65 : 38) * a, ADD = R(10) * a;
+    const A = R(run ? 45 : 28) * a, Kn = R(run ? 65 : 38) * a, ADD = R(MODEL_AXES ? 2 : 10) * a;   // el miner camina amb les cames més juntes
     const s = Math.sin(p), c = Math.cos(p);
     pose = {
-      LeftUpLeg:  { sw: -A * s - R(25) * air, ad: -ADD },
-      RightUpLeg: { sw:  A * s - R(25) * air, ad:  ADD },
+      LeftUpLeg:  { sw: -A * s - R(25) * air, ad: -LS * ADD },
+      RightUpLeg: { sw:  A * s - R(25) * air, ad:  LS * ADD },
       LeftLeg:    { sw: Kn * Math.max(0,  c) + R(50) * air },
       RightLeg:   { sw: Kn * Math.max(0, -c) + R(50) * air },
       LeftArm:    { sw:  A * 0.7 * s },
-      RightArm:   { sw: -A * 0.2 * s },   // porta l'espasa: es mou poc
+      RightArm:   { sw: -A * (MODEL_AXES ? 0.7 : 0.2) * s },   // el cavaller porta l'espasa: es mou poc
     };
   }
+  const sw = SMOKE.w;
+  const drag = sw > 0.99 ? 0.08 * Math.max(0, Math.sin((SMOKE.t - SMOKE.up) * 2.6)) : 0;   // xuclades
   for (const b in bones) {
     const B = bones[b], P = pose[b];
-    let q = Cesium.Quaternion.fromAxisAngle(B.lat, P.sw);
-    if (B.fwd && P.ad) q = Cesium.Quaternion.multiply(q, Cesium.Quaternion.fromAxisAngle(B.fwd, P.ad), new Cesium.Quaternion());
+    const qs = sw > 0.001 && !FALL.on ? smokeQuat(b, sw) : null;
+    if (!P && !qs) { if (B.active) releaseBone(B); continue; }
+    let q = Q_ID.clone();
+    if (P) {
+      q = Cesium.Quaternion.fromAxisAngle(B.lat, P.sw);
+      if (B.fwd && P.ad) q = Cesium.Quaternion.multiply(q, Cesium.Quaternion.fromAxisAngle(B.fwd, P.ad), new Cesium.Quaternion());
+    }
+    if (qs) {
+      if (b === 'LeftForeArm' && drag) Cesium.Quaternion.multiply(qs, Cesium.Quaternion.fromAxisAngle(B.lat, -drag), qs);
+      q = Cesium.Quaternion.slerp(q, qs, Math.min(1, sw * 2), new Cesium.Quaternion());
+    }
     const rot = Cesium.Matrix4.fromRotation(Cesium.Matrix3.fromQuaternion(q));
     B.node.matrix = Cesium.Matrix4.multiply(B.node.originalMatrix, rot, new Cesium.Matrix4());
     B.active = true;
   }
 }
 
+// punt desplaçat uns metres cap al nord i l'est
+function offsetLL(lat, lon, north, east) {
+  return [lat + Cesium.Math.toDegrees(north / 6378137), lon + Cesium.Math.toDegrees(east / (6378137 * Math.cos(R(lat))))];
+}
+
 function syncCameras() {
+  if (S.view !== 'third') return syncCamerasPOV();
+  viewer.camera.frustum.near = 1.0;
   S.tilt = Cesium.Math.clamp(S.tilt, 5, 125);
   S.range = Cesium.Math.clamp(S.range, 2.5, 80);
 
@@ -579,6 +723,47 @@ function syncCameras() {
   viewer.scene.light.direction = Cesium.Cartesian3.clone(cam.directionWC, viewer.scene.light.direction);
 }
 
+// Primera persona: la càmera és als ulls del personatge i mira cap on apunta el ratolí.
+// A Google li diem que miri un punt uns metres endavant des d'aquesta distància.
+function syncCamerasPOV() {
+  S.tilt = Cesium.Math.clamp(S.tilt, 10, 170);
+  if (FALL.on && FALL.ready && !FALL.switched && S.agl < -3) switchToAbyss();
+  const h = R(S.heading), t = R(S.tilt), D = 4;
+  // els ulls, una mica per davant del pit perquè mirant avall es vegin les cames;
+  // mentre fuma, la càmera recula un pèl perquè es vegi la mà arribant a la boca
+  const fwd = S.eyeFwd - 0.22 * SMOKE.w;
+  const [eLat, eLon] = offsetLL(S.lat, S.lon, Math.cos(h) * fwd, Math.sin(h) * fwd);
+  const agl = FALL.switched ? S.agl : Math.max(S.agl, FALL.on ? 0 : -1e9);
+  const eAlt = S.ground + agl + S.eye;
+  const dN = Math.cos(h) * Math.sin(t), dE = Math.sin(h) * Math.sin(t), dU = -Math.cos(t);
+  const [tLat, tLon] = offsetLL(eLat, eLon, dN * D, dE * D);
+  const tAlt = eAlt + dU * D;
+  if (map3d && !FALL.switched) {
+    map3d.center = { lat: tLat, lng: tLon, altitude: tAlt + CAL.vOffset };
+    map3d.heading = ((S.heading % 360) + 360) % 360;
+    map3d.tilt = S.tilt;
+    map3d.range = D;
+    map3d.fov = CFG.povFov;
+  }
+  const cam = viewer.camera;
+  const aspect = viewer.canvas.clientWidth / Math.max(1, viewer.canvas.clientHeight);
+  const v = R(CFG.povFov);
+  cam.frustum.fov = aspect > 1 ? 2 * Math.atan(Math.tan(v / 2) * aspect) : v;
+  cam.frustum.near = 0.05;                      // el cos és molt a prop de la càmera
+  const cp = map3d && map3d.cameraPosition;
+  const T = Cesium.Cartesian3.fromDegrees(tLon, tLat, tAlt + FALL.off);
+  // si Google ha hagut d'apujar la càmera, Cesium la segueix perquè el cos quadri amb el món
+  const P = (cp && isFinite(cp.altitude) && !FALL.switched)
+    ? Cesium.Cartesian3.fromDegrees(cp.lng, cp.lat, cp.altitude - CAL.vOffset + FALL.off)
+    : Cesium.Cartesian3.fromDegrees(eLon, eLat, eAlt + FALL.off);
+  const dir = Cesium.Cartesian3.normalize(Cesium.Cartesian3.subtract(T, P, new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  const nrm = Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(P, new Cesium.Cartesian3());
+  const up = Cesium.Cartesian3.normalize(Cesium.Cartesian3.subtract(nrm,
+    Cesium.Cartesian3.multiplyByScalar(dir, Cesium.Cartesian3.dot(nrm, dir), new Cesium.Cartesian3()), new Cesium.Cartesian3()), new Cesium.Cartesian3());
+  cam.setView({ destination: P, orientation: { direction: dir, up } });
+  viewer.scene.light.direction = Cesium.Cartesian3.clone(cam.directionWC, viewer.scene.light.direction);
+}
+
 // ------------------------------------------------------------------
 // CONTROLS
 // ------------------------------------------------------------------
@@ -601,6 +786,8 @@ function initInput() {
       viewer.scene.globe.baseColor = S.showGround ? new Cesium.Color(1, 0.2, 0.2, 0.35) : Cesium.Color.TRANSPARENT;
     }
     if (e.key === 'ñ' || e.key === 'Ñ' || e.code === 'Semicolon') { FALL.on ? resetFall() : startFall(); }
+    if (e.code === 'KeyF' && !e.repeat) startSmoke();
+    if (e.code === 'KeyV' && !e.repeat) cycleView();
     if (e.code === 'KeyI') { const h = document.getElementById('hud'); h.style.display = h.style.display === 'none' ? 'block' : 'none'; }
     if (e.code === 'KeyM') {
       if (document.pointerLockElement) document.exitPointerLock();
@@ -611,7 +798,7 @@ function initInput() {
   addEventListener('blur', () => S.keys = {});
 
   const cv = viewer.canvas; let drag = false;
-  cv.addEventListener('pointerdown', e => { if (e.pointerType !== 'mouse') return; drag = true; if (!document.pointerLockElement) cv.requestPointerLock(); });
+  cv.addEventListener('pointerdown', e => { if (e.pointerType !== 'mouse') return; if (e.button === 0) startSmoke(); drag = true; if (!document.pointerLockElement) cv.requestPointerLock(); });
   addEventListener('pointerup', () => drag = false);
   addEventListener('mousemove', e => {
     if (!drag && document.pointerLockElement !== cv) return;
@@ -630,7 +817,6 @@ function isTouchDevice() {
   return (navigator.maxTouchPoints || 0) > 0 && matchMedia('(pointer: coarse)').matches;
 }
 function initTouch() {
-  if (!isTouchDevice()) return;
   const ui = document.getElementById('touch'); ui.style.display = 'block';
   viewer.scene.globe.maximumScreenSpaceError = 4;          // una mica més lleuger per a l'iPad
 
@@ -656,6 +842,8 @@ function initTouch() {
       e.preventDefault();
       if (k === 'jump') S.keys.Space = true;
       if (k === 'run')  { JOY.run = !JOY.run; b.classList.toggle('on', JOY.run); }
+      if (k === 'smoke') startSmoke();
+      if (k === 'view') cycleView();
       if (k === 'fall') { FALL.on ? resetFall() : startFall(); }
       if (k === 'info') { const h = document.getElementById('hud'); h.style.display = h.style.display === 'none' ? 'block' : 'none'; }
     });
@@ -689,8 +877,8 @@ function initTouch() {
 function updateHud(onGround) {
   document.getElementById('hud').textContent =
 `WASD caminar · Shift córrer · Espai saltar
-Clic: el ratolí mou la càmera · Esc: deixar-lo anar · Roda zoom
-Q / E girar càmera
+Clic esquerre (o F): fumar (només el miner) · el ratolí mou la càmera · Esc: deixar-lo anar · Roda zoom
+Q / E girar càmera · V canviar de vista (3a persona / primera persona)
 
 CALIBRATGE
 [ ]   FOV: ${CAL.vfov}°
@@ -713,6 +901,18 @@ ${S.lat.toFixed(6)}, ${S.lon.toFixed(6)}  ${onGround ? '' : '(a l\'aire)'}`;
 function turnTowards(a, b, k) {
   let d = ((b - a + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
   return a + d * Math.min(1, k);
+}
+// Llegeix coordenades escrites de moltes maneres:
+//   42.23, 1.77 · 42.23 1.77 · (42.23, 1.77) · 42.23 - 1.77 · 42.23-1.77 · 42.23; -1.77
+//   o un enllaç de Google Maps (…/@42.23,1.77,15z)
+// Un guió entre els dos números és un separador; un guió davant d'un número
+// (després d'una coma, d'un espai o d'un parèntesi) és un signe negatiu.
+function parseCoords(s) {
+  s = String(s)
+    .replace(/[()\[\]]/g, ' ')
+    .replace(/(\d)\s*-\s+(?=\d)/g, '$1 ')     // "42.23 - 1.77"
+    .replace(/(\d)-(?=\d)/g, '$1 ');           // "42.23-1.77"
+  return (s.match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
 }
 function val(id) { return document.getElementById(id).value.trim(); }
 function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : (k === 'cav_cal3' ? JSON.parse(v) : v); } catch(e) { return d; } }
